@@ -1,0 +1,220 @@
+# Reusable investor-demo deploy verification — Render.
+#
+# Render's own `autoDeploy` (set in the venture's render.yaml Blueprint,
+# watching the `demo` branch) does the actual build+deploy — this workflow
+# does what Render doesn't: wait for that deploy to actually finish, smoke
+# test it, roll back on failure, and emit evidence. Same shape as
+# build-deploy.yml's smoke-and-rollback job, translated to the Render API
+# instead of gcloud.
+#
+# Promotion to `demo` is a manual fast-forward push
+# (`git push origin main:demo`), same ritual already used for staging —
+# not automated here. This workflow triggers off the resulting push, via
+# the caller's thin deploy-demo.yml wrapper (see template-fullstack-app).
+#
+# Setup a venture needs before using this (see
+# Sheth-Family/gcp-bootstrap's render.tf/README and
+# template-fullstack-app's ADR-0012-render-investor-demo-environment.md):
+#   - render.yaml committed to the repo, connected as a Blueprint in the
+#     Render dashboard (one-time, by a human — Render's Terraform
+#     provider can't create free-tier web services)
+#   - RENDER_API_KEY and RENDER_WEB_SERVICE_ID pushed into the repo's
+#     GitHub secrets/variables by gcp-bootstrap's wire-github.sh
+#
+# Deliberately takes a single `render-web-service-id` — not a list. Every
+# golden-image venture's demo is one Render service (the whole app, same
+# monolith-first shape as its Cloud Run deploy — see ADR-0002). A venture
+# with more than one Render service for its demo needs a second call to
+# this workflow per service, not a change to this one; resist generalizing
+# to a list until a second real case actually needs it.
+
+name: Render Deploy Verify (reusable)
+
+on:
+  workflow_call:
+    inputs:
+      render-web-service-id:
+        description: "Render service ID (srv-xxxxxxxxxxxx) for the venture's demo web service."
+        required: true
+        type: string
+      health-check-url:
+        description: "Full URL to poll after Render reports the deploy live (e.g. https://your-venture-demo.onrender.com/api/health)."
+        required: true
+        type: string
+    secrets:
+      RENDER_API_KEY:
+        description: "Render API key (Account Settings > API Keys)."
+        required: true
+      MISSION_CONTROL_URL:
+        description: "Optional evidence-ingest endpoint. If set, post-deploy smoke results are POSTed here as JSON. Non-blocking on failure."
+        required: false
+      MISSION_CONTROL_INGEST_TOKEN:
+        description: "Bearer token for MISSION_CONTROL_URL."
+        required: false
+
+permissions:
+  contents: read
+
+jobs:
+  wait-and-verify:
+    name: Wait for Render deploy, smoke test, rollback on failure
+    runs-on: ubuntu-latest
+    steps:
+      - name: Wait for Render's autoDeploy to reach a terminal state
+        id: wait
+        env:
+          RENDER_API_KEY: ${{ secrets.RENDER_API_KEY }}
+          SERVICE_ID: ${{ inputs.render-web-service-id }}
+          SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          echo "Waiting for a Render deploy of commit ${SHA:0:7} on ${SERVICE_ID}..."
+          target_id=""
+          status=""
+          for i in $(seq 1 40); do
+            deploys=$(curl -sf \
+              -H "Authorization: Bearer ${RENDER_API_KEY}" \
+              "https://api.render.com/v1/services/${SERVICE_ID}/deploys?limit=5")
+            # Render's response is a list of {deploy: {...}} envelopes, newest first.
+            # Render's docs describe list-endpoint items as paired with a
+            # sibling `cursor` field, implying each item wraps the actual
+            # resource under a key (here, `deploy`) rather than being the
+            # resource itself — but the exact shape isn't confirmed against
+            # a live call. entry.get('deploy', entry) handles either shape:
+            # unwraps if present, uses the entry directly if not.
+            match=$(echo "$deploys" | python3 -c "
+          import json, sys
+          deploys = json.load(sys.stdin)
+          sha = '${SHA}'
+          for entry in deploys:
+              d = entry.get('deploy', entry)
+              if d.get('commit', {}).get('id', '') == sha:
+                  print(f\"{d['id']}\t{d['status']}\")
+                  break
+          ")
+            if [ -n "$match" ]; then
+              target_id="${match%%$'\t'*}"
+              status="${match##*$'\t'}"
+              echo "Attempt $i: deploy ${target_id} for ${SHA:0:7} → ${status}"
+              case "$status" in
+                live) break ;;
+                build_failed|update_failed|canceled|deactivated)
+                  echo "::error::Render deploy ${status} for commit ${SHA:0:7}."
+                  echo "status=${status}" >> "$GITHUB_OUTPUT"
+                  exit 1
+                  ;;
+              esac
+            else
+              echo "Attempt $i: no deploy found yet for ${SHA:0:7} — retrying in 15s"
+            fi
+            sleep 15
+          done
+          if [ "$status" != "live" ]; then
+            echo "::error::Timed out waiting for Render deploy to go live (last status: ${status:-none})."
+            exit 1
+          fi
+          echo "target_id=${target_id}" >> "$GITHUB_OUTPUT"
+          echo "status=${status}" >> "$GITHUB_OUTPUT"
+
+      - name: Post-deploy smoke test
+        id: smoke
+        env:
+          HEALTH_URL: ${{ inputs.health-check-url }}
+        run: |
+          set -euo pipefail
+          echo "Polling $HEALTH_URL ..."
+          ok=0
+          for i in $(seq 1 12); do
+            HTTP_CODE=$(curl -sf --max-time 10 -w '%{http_code}' -o /tmp/health.json "$HEALTH_URL" 2>/dev/null || echo "000")
+            if [ "$HTTP_CODE" = "200" ]; then
+              echo "✅ Smoke passed (attempt $i)"
+              cat /tmp/health.json
+              ok=1
+              break
+            fi
+            echo "⏳ Attempt $i/12: HTTP $HTTP_CODE — retrying in 5s"
+            sleep 5
+          done
+          if [ "$ok" = "0" ]; then
+            echo "❌ Smoke failed after 12 attempts (60s) — triggering rollback"
+            cat /tmp/health.json 2>/dev/null || true
+            exit 1
+          fi
+
+      - name: Roll back to prior successful deploy
+        if: failure() && steps.wait.outputs.target_id != ''
+        id: rollback
+        env:
+          RENDER_API_KEY: ${{ secrets.RENDER_API_KEY }}
+          SERVICE_ID: ${{ inputs.render-web-service-id }}
+        run: |
+          set -euo pipefail
+          deploys=$(curl -sf \
+            -H "Authorization: Bearer ${RENDER_API_KEY}" \
+            "https://api.render.com/v1/services/${SERVICE_ID}/deploys?limit=10")
+          # First "live" deploy that ISN'T the one we just failed on.
+          prior_id=$(echo "$deploys" | python3 -c "
+          import json, sys
+          deploys = json.load(sys.stdin)
+          skip = '${{ steps.wait.outputs.target_id }}'
+          for entry in deploys:
+              d = entry.get('deploy', entry)
+              if d.get('status') == 'live' and d.get('id') != skip:
+                  print(d['id'])
+                  break
+          ")
+          if [ -z "$prior_id" ]; then
+            echo "⚠️  No prior successful deploy found — nothing to roll back to (first deploy?)."
+            echo "rolled_back=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "⏪ Rolling back ${SERVICE_ID} to ${prior_id} ..."
+          curl -sf -X POST \
+            -H "Authorization: Bearer ${RENDER_API_KEY}" \
+            -H "Content-Type: application/json" \
+            "https://api.render.com/v1/services/${SERVICE_ID}/rollback" \
+            -d "{\"deployId\": \"${prior_id}\"}"
+          echo "rolled_back=true" >> "$GITHUB_OUTPUT"
+          echo "prior_id=${prior_id}" >> "$GITHUB_OUTPUT"
+          echo "✅ Rollback triggered — ${prior_id}"
+
+      - name: Emit Mission Control evidence
+        if: always()
+        env:
+          MISSION_CONTROL_URL: ${{ secrets.MISSION_CONTROL_URL }}
+          MISSION_CONTROL_INGEST_TOKEN: ${{ secrets.MISSION_CONTROL_INGEST_TOKEN }}
+          SERVICE_ID: ${{ inputs.render-web-service-id }}
+          SHA: ${{ github.sha }}
+          SMOKE_RESULT: ${{ steps.smoke.outcome }}
+          ROLLED_BACK: ${{ steps.rollback.outputs.rolled_back || 'false' }}
+          RUN_ID: ${{ github.run_id }}
+          RUN_URL: "https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+        run: |
+          jq -n \
+            --arg event "post_deploy_smoke" \
+            --arg service_id "$SERVICE_ID" \
+            --arg environment "demo" \
+            --arg sha "$SHA" \
+            --arg result "$SMOKE_RESULT" \
+            --arg rollback_triggered "$ROLLED_BACK" \
+            --arg run_id "$RUN_ID" \
+            --arg run_url "$RUN_URL" \
+            '{event: $event, service_id: $service_id, environment: $environment, sha: $sha,
+              result: $result, rollback_triggered: $rollback_triggered, run_id: $run_id, run_url: $run_url}' \
+            > /tmp/smoke-evidence.json
+          echo "Evidence:"
+          cat /tmp/smoke-evidence.json
+          if [ -n "${MISSION_CONTROL_URL:-}" ]; then
+            curl -sf -X POST "${MISSION_CONTROL_URL}/ingest" \
+              -H "Authorization: Bearer ${MISSION_CONTROL_INGEST_TOKEN}" \
+              -H "Content-Type: application/json" \
+              -d @/tmp/smoke-evidence.json \
+              || echo "⚠️  Mission Control ingest failed (non-blocking)"
+
+      - name: Upload smoke evidence artifact
+        if: always()
+        uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5.0.0
+        with:
+          name: smoke-evidence-demo-${{ github.run_id }}
+          path: /tmp/smoke-evidence.json
+          retention-days: 30
