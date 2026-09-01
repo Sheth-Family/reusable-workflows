@@ -1,0 +1,49 @@
+name: CI — Type check, Lint, Audit (reusable)
+
+# Merge-blocking quality gates:
+#   typecheck — tsc --noEmit (catches TS errors the build can silently skip)
+#   lint       — eslint . (ESLint with Next.js rules)
+#   audit      — npm audit --audit-level=high (flags high/critical vulns; Dependabot covers the rest)
+#
+# No continue-on-error — all three must pass to merge.
+#
+# Pins an explicit Node version rather than relying on whatever the runner
+# image happens to preinstall — that drifted silently in the original
+# non-reusable version of this workflow (template-fullstack-app history).
+
+on:
+  workflow_call:
+    inputs:
+      node-version:
+        description: "Node version to run checks against. Should match the Dockerfile's runtime version."
+        required: false
+        type: string
+        default: "22"
+
+permissions:
+  contents: read
+
+jobs:
+  quality:
+    name: Typecheck + Lint + Audit
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Node
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: ${{ inputs.node-version }}
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: TypeScript typecheck
+        run: npm run typecheck
+
+      - name: ESLint
+        run: npm run lint
+
+      - name: Dependency audit (high and critical)
+        run: npm audit --audit-level=high

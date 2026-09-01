@@ -1,0 +1,292 @@
+# Reusable build+deploy workflow — GCP Cloud Run via Workload Identity
+# Federation (keyless GitHub → GCP auth, no long-lived service account keys).
+#
+# Hosted centrally in Sheth-Family/reusable-workflows so every venture calls
+# the SAME versioned logic instead of maintaining its own copy — see this
+# repo's README for the versioning/update model. Cross-repo reusable
+# workflows do NOT automatically see the calling repo's `vars` context, so
+# every value that used to be a bare `vars.X` reference in the golden
+# image's local copy is now an explicit input the caller must pass in.
+#
+# Setup a venture needs before using this (see ADR-0006/ADR-0007 in the
+# golden image, and Sheth-Family/gcp-bootstrap for automating it):
+#   - GCP project, Artifact Registry repo, WIF pool/provider, deployer SA
+#   - Secrets named in `set_secrets` present in GCP Secret Manager
+#   - If run_migrations is true: a GCP secret holding the raw
+#     postgresql://postgres:PASSWORD@db.<ref>.supabase.co:5432/postgres
+#     connection string (see supabase-db-url-secret), and a
+#     SUPABASE_ACCESS_TOKEN passed as a GitHub secret
+#
+# See ADR-0008-ci-reusable-workflow.md for constraints discovered while
+# extracting this pattern (permissions must be declared explicitly in the
+# caller; boolean inputs need type: boolean; set_secrets must be a single
+# quoted string, not a folded block scalar).
+
+name: Build and Deploy (reusable)
+
+on:
+  workflow_call:
+    inputs:
+      environment:
+        required: true
+        type: string
+      service:
+        required: true
+        type: string
+      next_public_env:
+        required: true
+        type: string
+      dd_env:
+        required: true
+        type: string
+      max_instances:
+        required: true
+        type: number
+      service_account:
+        required: true
+        type: string
+      set_secrets:
+        description: "Comma-separated SECRET_ENV_NAME=gcp-secret-name:version pairs"
+        required: true
+        type: string
+      gcp-project-id:
+        required: true
+        type: string
+      gcp-region:
+        required: true
+        type: string
+      gcp-wif-provider:
+        required: true
+        type: string
+      gcp-artifact-repo:
+        required: true
+        type: string
+      run-migrations:
+        required: false
+        type: boolean
+        default: true
+      supabase-project-ref:
+        description: "Required if run-migrations is true"
+        required: false
+        type: string
+        default: ""
+      supabase-db-url-secret:
+        description: "GCP Secret Manager secret name holding the raw postgresql://postgres:PASSWORD@db.<ref>.supabase.co connection string. Required if run-migrations is true."
+        required: false
+        type: string
+        default: ""
+      enable-smoke-and-rollback:
+        required: false
+        type: boolean
+        default: true
+      health-check-url:
+        description: "Full URL to poll after deploy (e.g. https://your-app.example.com/api/health). Required if enable-smoke-and-rollback is true."
+        required: false
+        type: string
+        default: ""
+    secrets:
+      SUPABASE_ACCESS_TOKEN:
+        description: "Supabase Management API token. Required if run-migrations is true."
+        required: false
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  pre-deploy:
+    name: Capture prior Cloud Run revision
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    outputs:
+      prior_revision: ${{ steps.prior.outputs.revision }}
+    steps:
+      - name: Authenticate to GCP (Workload Identity Federation)
+        uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3.0.0
+        with:
+          workload_identity_provider: ${{ inputs.gcp-wif-provider }}
+          service_account: ${{ inputs.service_account }}
+
+      - name: Set up Cloud SDK
+        uses: google-github-actions/setup-gcloud@aa5489c8933f4cc7a4f7d45035b3b1440c9c10db # v3.0.1
+
+      - name: Capture prior revision
+        id: prior
+        env:
+          SERVICE: ${{ inputs.service }}
+          REGION: ${{ inputs.gcp-region }}
+          PROJECT_ID: ${{ inputs.gcp-project-id }}
+        run: |
+          set -uo pipefail
+          REVISION=$(gcloud run revisions list \
+            --service="$SERVICE" \
+            --region="$REGION" \
+            --project="$PROJECT_ID" \
+            --format='value(metadata.name)' \
+            --limit=1 \
+            --sort-by='~metadata.creationTimestamp' 2>/dev/null || echo "")
+          echo "revision=${REVISION}" >> "$GITHUB_OUTPUT"
+          echo "Prior revision: ${REVISION:-<none — first deploy>}"
+
+  build-and-deploy:
+    name: Build and deploy (${{ inputs.environment }})
+    needs: pre-deploy
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.environment }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Authenticate to GCP (Workload Identity Federation)
+        uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3.0.0
+        with:
+          workload_identity_provider: ${{ inputs.gcp-wif-provider }}
+          service_account: ${{ inputs.service_account }}
+
+      - name: Set up Cloud SDK
+        uses: google-github-actions/setup-gcloud@aa5489c8933f4cc7a4f7d45035b3b1440c9c10db # v3.0.1
+
+      - name: Configure Docker for Artifact Registry
+        env:
+          REGION: ${{ inputs.gcp-region }}
+        run: gcloud auth configure-docker "${REGION}-docker.pkg.dev" --quiet
+
+      - name: Build and push image
+        env:
+          IMAGE: "${{ inputs.gcp-region }}-docker.pkg.dev/${{ inputs.gcp-project-id }}/${{ inputs.gcp-artifact-repo }}/${{ inputs.service }}:${{ github.sha }}"
+          NEXT_PUBLIC_ENV: ${{ inputs.next_public_env }}
+        run: |
+          set -euo pipefail
+          docker build \
+            --build-arg NEXT_PUBLIC_ENV="$NEXT_PUBLIC_ENV" \
+            -t "$IMAGE" .
+          docker push "$IMAGE"
+
+      - name: Apply Supabase migrations
+        if: inputs.run-migrations
+        env:
+          SUPABASE_ACCESS_TOKEN: ${{ secrets.SUPABASE_ACCESS_TOKEN }}
+          SUPABASE_PROJECT_REF: ${{ inputs.supabase-project-ref }}
+          DB_URL_SECRET: ${{ inputs.supabase-db-url-secret }}
+          PROJECT_ID: ${{ inputs.gcp-project-id }}
+        run: |
+          set -euo pipefail
+          if [ -z "$SUPABASE_ACCESS_TOKEN" ] || [ -z "$SUPABASE_PROJECT_REF" ] || [ -z "$DB_URL_SECRET" ]; then
+            echo "::error::run-migrations is true but SUPABASE_ACCESS_TOKEN secret, supabase-project-ref, or supabase-db-url-secret input is missing."
+            exit 1
+          fi
+
+          # Resolve the pooler host from the Management API instead of
+          # hardcoding or guessing a region/instance number. A hardcoded
+          # guess here caused a multi-hour production incident in
+          # LiveSimpli/simpli (2026-08-31/09-01): the pooler host isn't
+          # just region-specific, it's a specific numbered instance
+          # (aws-0, aws-1, ...) per project, and a stale/guessed value
+          # fails with "tenant not found" — a confusing error that looks
+          # like a bad password, not a routing problem. Always ask
+          # Supabase which pooler this project actually uses.
+          POOLER_HOST=$(curl -sf \
+            -H "Authorization: Bearer ${SUPABASE_ACCESS_TOKEN}" \
+            "https://api.supabase.com/v1/projects/${SUPABASE_PROJECT_REF}/config/database/pooler" \
+            | python3 -c "import json,sys; print(json.load(sys.stdin)[0]['db_host'])")
+          echo "Resolved pooler host: ${POOLER_HOST}"
+
+          # SIM-2471 (LiveSimpli/simpli): db.*.supabase.co resolves IPv6-only;
+          # GitHub Actions runners have no IPv6 route to AWS. Use the
+          # session-mode pooler (IPv4, port 5432) instead — required for
+          # `supabase db push`'s DDL/prepared-statement usage; transaction
+          # mode (port 6543) doesn't support it. User changes from
+          # `postgres` to `postgres.[ref]` per Supabase pooler auth
+          # requirements.
+          DB_URL=$(gcloud secrets versions access latest --secret="$DB_URL_SECRET" --project="$PROJECT_ID")
+          echo "::add-mask::${DB_URL}"
+          POOLER_URL=$(printf '%s' "$DB_URL" | POOLER_HOST="$POOLER_HOST" python3 -c "import re,os,sys;u=sys.stdin.read().strip();m=re.match('postgresql://([^:]+):([^@]+)@db[.]([^.]+)[.]supabase[.]co:[0-9]+/([^?]*)',u);print('postgresql://'+m.group(1)+'.'+m.group(3)+':'+m.group(2)+'@'+os.environ['POOLER_HOST']+':5432/'+m.group(4) if m else u)")
+          echo "::add-mask::${POOLER_URL}"
+          npx supabase db push --db-url "$POOLER_URL"
+
+      - name: Deploy to Cloud Run
+        env:
+          IMAGE: "${{ inputs.gcp-region }}-docker.pkg.dev/${{ inputs.gcp-project-id }}/${{ inputs.gcp-artifact-repo }}/${{ inputs.service }}:${{ github.sha }}"
+          SERVICE: ${{ inputs.service }}
+          REGION: ${{ inputs.gcp-region }}
+          MAX_INSTANCES: ${{ inputs.max_instances }}
+          NEXT_PUBLIC_ENV: ${{ inputs.next_public_env }}
+          DD_ENV: ${{ inputs.dd_env }}
+          SET_SECRETS: ${{ inputs.set_secrets }}
+        run: |
+          set -euo pipefail
+          gcloud run deploy "$SERVICE" \
+            --image="$IMAGE" \
+            --region="$REGION" \
+            --max-instances="$MAX_INSTANCES" \
+            --set-env-vars="NEXT_PUBLIC_ENV=${NEXT_PUBLIC_ENV},DD_ENV=${DD_ENV}" \
+            --set-secrets="$SET_SECRETS" \
+            --quiet
+
+  smoke-and-rollback:
+    name: Smoke & Rollback (${{ inputs.environment }})
+    needs: [pre-deploy, build-and-deploy]
+    if: inputs.enable-smoke-and-rollback
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Authenticate to GCP (Workload Identity Federation)
+        uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3.0.0
+        with:
+          workload_identity_provider: ${{ inputs.gcp-wif-provider }}
+          service_account: ${{ inputs.service_account }}
+
+      - name: Set up Cloud SDK
+        uses: google-github-actions/setup-gcloud@aa5489c8933f4cc7a4f7d45035b3b1440c9c10db # v3.0.1
+
+      - name: Post-deploy smoke test
+        id: smoke
+        env:
+          HEALTH_URL: ${{ inputs.health-check-url }}
+        run: |
+          set -euo pipefail
+          if [ -z "$HEALTH_URL" ]; then
+            echo "::error::enable-smoke-and-rollback is true but health-check-url input is empty."
+            exit 1
+          fi
+          echo "Polling $HEALTH_URL ..."
+          ok=0
+          for i in $(seq 1 12); do
+            HTTP_CODE=$(curl -sf --max-time 10 -w '%{http_code}' -o /tmp/health.json "$HEALTH_URL" 2>/dev/null || echo "000")
+            if [ "$HTTP_CODE" = "200" ]; then
+              echo "✅ Smoke passed (attempt $i)"
+              cat /tmp/health.json
+              ok=1
+              break
+            fi
+            echo "⏳ Attempt $i/12: HTTP $HTTP_CODE — retrying in 5s"
+            sleep 5
+          done
+          if [ "$ok" = "0" ]; then
+            echo "❌ Smoke failed after 12 attempts (60s) — triggering rollback"
+            cat /tmp/health.json 2>/dev/null || true
+            exit 1
+          fi
+
+      - name: Rollback to prior revision
+        if: failure()
+        env:
+          SERVICE: ${{ inputs.service }}
+          REGION: ${{ inputs.gcp-region }}
+          PROJECT_ID: ${{ inputs.gcp-project-id }}
+          PRIOR: ${{ needs.pre-deploy.outputs.prior_revision }}
+        run: |
+          set -euo pipefail
+          if [ -n "$PRIOR" ]; then
+            echo "⏪ Rolling back ${SERVICE} to ${PRIOR} ..."
+            gcloud run services update-traffic "$SERVICE" \
+              --to-revisions="${PRIOR}=100" \
+              --region="$REGION" \
+              --project="$PROJECT_ID"
+            echo "✅ Rollback complete — ${PRIOR} serving 100%"
+          else
+            echo "⚠️  No prior revision recorded — skipping rollback (first deploy?)"
+          fi

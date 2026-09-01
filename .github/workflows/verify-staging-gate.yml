@@ -1,0 +1,47 @@
+name: Verify commit was staged first (reusable)
+
+# Blocks a prod deploy unless the exact commit being deployed has already
+# been through staging — prevents deploying code nobody has actually run.
+# Optional for ventures that don't have a staging environment yet; wire this
+# in as a `needs:` dependency ahead of the deploy job once one exists.
+
+on:
+  workflow_call:
+    inputs:
+      staging-branch:
+        description: "Branch that must contain this commit"
+        required: false
+        type: string
+        default: "staging"
+
+permissions:
+  contents: read
+
+jobs:
+  verify-staging:
+    name: Check commit exists in ${{ inputs.staging-branch }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - name: Check commit exists in staging branch
+        env:
+          STAGING_BRANCH: ${{ inputs.staging-branch }}
+        run: |
+          set -euo pipefail
+          git fetch origin "$STAGING_BRANCH"
+          if git merge-base --is-ancestor "$GITHUB_SHA" "origin/$STAGING_BRANCH"; then
+            echo "✅ Commit $GITHUB_SHA exists in $STAGING_BRANCH — safe to promote to prod"
+          else
+            echo "❌ Commit $GITHUB_SHA has NOT been deployed to $STAGING_BRANCH first."
+            echo ""
+            echo "Required workflow:"
+            echo "  1. Merge feature branch → $STAGING_BRANCH"
+            echo "  2. Verify on $STAGING_BRANCH"
+            echo "  3. Fast-forward main to $STAGING_BRANCH (promote)"
+            echo ""
+            echo "Never merge directly to main. Staging and prod data must stay isolated."
+            exit 1
+          fi

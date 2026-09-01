@@ -1,0 +1,60 @@
+name: Opengrep Scan (reusable)
+
+# Static analysis (SAST) via Opengrep — https://github.com/opengrep/opengrep
+#
+# Opengrep is an open-source fork of Semgrep (LGPL 2.1), created after Semgrep
+# moved features behind a commercial license. Rule-format compatible with
+# Semgrep, so `--config auto` pulls the same free community/registry rulesets.
+#
+# Implementation note: no official first-party GitHub Action exists in the
+# opengrep org (only unofficial third-party ones). Following the same
+# precedent as secret-scan.yml — install the pinned release binary directly
+# rather than depend on an unverified marketplace action.
+#
+# No SARIF upload to GitHub code scanning here: that requires GitHub Advanced
+# Security, which most free-plan orgs don't have (see secret-scan.yml /
+# gitleaks history for the same constraint). Findings are printed to the job
+# log and the job fails on any result — same shape as the gitleaks job.
+#
+# Bump opengrep-version below (or override via input) when a new release is verified.
+
+on:
+  workflow_call:
+    inputs:
+      opengrep-version:
+        description: "Pinned Opengrep release version"
+        required: false
+        type: string
+        default: "1.29.0"
+
+permissions:
+  contents: read
+
+jobs:
+  opengrep:
+    name: opengrep — SAST
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install opengrep
+        env:
+          OPENGREP_VERSION: ${{ inputs.opengrep-version }}
+        run: |
+          set -euo pipefail
+          curl -fsSL \
+            "https://github.com/opengrep/opengrep/releases/download/v${OPENGREP_VERSION}/opengrep_manylinux_x86" \
+            -o /tmp/opengrep
+          chmod +x /tmp/opengrep
+          sudo mv /tmp/opengrep /usr/local/bin/opengrep
+          opengrep --version
+
+      - name: Run opengrep
+        run: |
+          set -euo pipefail
+          opengrep scan \
+            --config auto \
+            --error \
+            .
