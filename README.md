@@ -87,7 +87,19 @@ same-repo, always correct).
 - `build-deploy.yml` — build, push to Artifact Registry, run Supabase
   migrations, deploy to Cloud Run, smoke-test, and auto-rollback on smoke
   failure. See the file's own header comment for the full input list and
-  required GCP/Supabase setup.
+  required GCP/Supabase setup. Optional capabilities (all off/empty by
+  default, so adopting them is opt-in per venture): `test-command` (run
+  before the Docker build), `build-secrets` (Secret-Manager-backed
+  `--build-arg`s, e.g. for `NEXT_PUBLIC_*` values that must be baked in),
+  `extra-env-vars` (plain `--set-env-vars` beyond `NEXT_PUBLIC_ENV`/`DD_ENV`),
+  a Datadog deploy-event ping, a Cloudflare cache purge, a post-deploy
+  Cloud Run log audit for DB errors, and Mission Control evidence emission
+  (POSTs the smoke-test result as JSON if `MISSION_CONTROL_URL` is set, and
+  always uploads it as a build artifact). These were generalized out of
+  LiveSimpli/simpli's own build-deploy.yml when simpli migrated onto this
+  workflow (2026-09-01) — simpli had grown real capability (a 220-test
+  pre-deploy gate, build-time `NEXT_PUBLIC_*` secrets, Datadog/Cloudflare/log-audit
+  steps, Mission Control) that a naive migration would have silently dropped.
 
 ## The Supabase migration step, specifically
 

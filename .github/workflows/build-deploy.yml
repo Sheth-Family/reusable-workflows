@@ -21,6 +21,12 @@
 # extracting this pattern (permissions must be declared explicitly in the
 # caller; boolean inputs need type: boolean; set_secrets must be a single
 # quoted string, not a folded block scalar).
+#
+# Optional capabilities below (test-command, build-secrets, extra-env-vars,
+# Datadog deploy events, Cloudflare cache purge, post-deploy log audit,
+# Mission Control evidence) were generalized out of LiveSimpli/simpli's
+# bespoke build-deploy.yml when simpli migrated onto this shared workflow —
+# they default to off/empty so ventures that don't need them see no change.
 
 name: Build and Deploy (reusable)
 
@@ -46,7 +52,7 @@ on:
         required: true
         type: string
       set_secrets:
-        description: "Comma-separated SECRET_ENV_NAME=gcp-secret-name:version pairs"
+        description: "Comma-separated SECRET_ENV_NAME=gcp-secret-name:version pairs, mounted at runtime via Cloud Run --set-secrets"
         required: true
         type: string
       gcp-project-id:
@@ -84,9 +90,58 @@ on:
         required: false
         type: string
         default: ""
+      test-command:
+        description: "Optional shell command run before the Docker build (e.g. a chained npm test suite). Fails the deploy if non-zero. Empty = skipped."
+        required: false
+        type: string
+        default: ""
+      build-secrets:
+        description: "Comma-separated BUILD_ARG_NAME=gcp-secret-name:version pairs, resolved via Secret Manager and passed as `docker build --build-arg`. Use for NEXT_PUBLIC_* values that must be baked in at build time."
+        required: false
+        type: string
+        default: ""
+      extra-env-vars:
+        description: "Comma-separated plain KEY=value pairs (not secrets) appended to Cloud Run --set-env-vars alongside NEXT_PUBLIC_ENV/DD_ENV."
+        required: false
+        type: string
+        default: ""
+      datadog-api-key-secret:
+        description: "GCP Secret Manager secret name holding a Datadog API key. If set, a deploy event is sent after Cloud Run deploy succeeds. Empty = skipped."
+        required: false
+        type: string
+        default: ""
+      dd-site:
+        description: "Datadog site for the deploy-event API call (only used if datadog-api-key-secret is set)."
+        required: false
+        type: string
+        default: "datadoghq.com"
+      cloudflare-zone-id:
+        description: "Cloudflare zone ID to purge after deploy. Requires cloudflare-purge-urls and the CLOUDFLARE_API_TOKEN secret. Empty = skipped."
+        required: false
+        type: string
+        default: ""
+      cloudflare-purge-urls:
+        description: "Comma-separated absolute URLs to purge from Cloudflare's cache after deploy. Required if cloudflare-zone-id is set."
+        required: false
+        type: string
+        default: ""
+      enable-log-audit:
+        description: "Scan the last 10 minutes of Cloud Run logs for DB-related errors after deploy. Requires roles/logging.viewer on the deployer service account — fails soft (continue-on-error) if missing."
+        required: false
+        type: boolean
+        default: false
     secrets:
       SUPABASE_ACCESS_TOKEN:
         description: "Supabase Management API token. Required if run-migrations is true."
+        required: false
+      CLOUDFLARE_API_TOKEN:
+        description: "Cloudflare API token with Zone:Cache Purge permission. Required if cloudflare-zone-id is set."
+        required: false
+      MISSION_CONTROL_URL:
+        description: "Optional evidence-ingest endpoint. If set, post-deploy smoke results are POSTed here as JSON. Non-blocking on failure."
+        required: false
+      MISSION_CONTROL_INGEST_TOKEN:
+        description: "Bearer token for MISSION_CONTROL_URL."
         required: false
 
 permissions:
@@ -138,6 +193,10 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
+      - name: Run pre-deploy tests
+        if: inputs.test-command != ''
+        run: ${{ inputs.test-command }}
+
       - name: Authenticate to GCP (Workload Identity Federation)
         uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3.0.0
         with:
@@ -156,11 +215,24 @@ jobs:
         env:
           IMAGE: "${{ inputs.gcp-region }}-docker.pkg.dev/${{ inputs.gcp-project-id }}/${{ inputs.gcp-artifact-repo }}/${{ inputs.service }}:${{ github.sha }}"
           NEXT_PUBLIC_ENV: ${{ inputs.next_public_env }}
+          BUILD_SECRETS: ${{ inputs.build-secrets }}
+          PROJECT_ID: ${{ inputs.gcp-project-id }}
         run: |
           set -euo pipefail
-          docker build \
-            --build-arg NEXT_PUBLIC_ENV="$NEXT_PUBLIC_ENV" \
-            -t "$IMAGE" .
+          BUILD_ARGS=(--build-arg "NEXT_PUBLIC_ENV=${NEXT_PUBLIC_ENV}")
+          if [ -n "$BUILD_SECRETS" ]; then
+            IFS=',' read -ra PAIRS <<< "$BUILD_SECRETS"
+            for pair in "${PAIRS[@]}"; do
+              ARG_NAME="${pair%%=*}"
+              SECRET_REF="${pair#*=}"
+              SECRET_NAME="${SECRET_REF%%:*}"
+              SECRET_VERSION="${SECRET_REF#*:}"
+              VALUE=$(gcloud secrets versions access "$SECRET_VERSION" --secret="$SECRET_NAME" --project="$PROJECT_ID")
+              echo "::add-mask::${VALUE}"
+              BUILD_ARGS+=(--build-arg "${ARG_NAME}=${VALUE}")
+            done
+          fi
+          docker build "${BUILD_ARGS[@]}" -t "$IMAGE" .
           docker push "$IMAGE"
 
       - name: Apply Supabase migrations
@@ -214,15 +286,93 @@ jobs:
           NEXT_PUBLIC_ENV: ${{ inputs.next_public_env }}
           DD_ENV: ${{ inputs.dd_env }}
           SET_SECRETS: ${{ inputs.set_secrets }}
+          EXTRA_ENV_VARS: ${{ inputs.extra-env-vars }}
         run: |
           set -euo pipefail
+          ENV_VARS="NEXT_PUBLIC_ENV=${NEXT_PUBLIC_ENV},DD_ENV=${DD_ENV}"
+          if [ -n "$EXTRA_ENV_VARS" ]; then
+            ENV_VARS="${ENV_VARS},${EXTRA_ENV_VARS}"
+          fi
           gcloud run deploy "$SERVICE" \
             --image="$IMAGE" \
             --region="$REGION" \
             --max-instances="$MAX_INSTANCES" \
-            --set-env-vars="NEXT_PUBLIC_ENV=${NEXT_PUBLIC_ENV},DD_ENV=${DD_ENV}" \
+            --set-env-vars="$ENV_VARS" \
             --set-secrets="$SET_SECRETS" \
             --quiet
+
+      - name: Send deploy event to Datadog
+        if: inputs.datadog-api-key-secret != ''
+        continue-on-error: true
+        env:
+          DD_API_KEY_SECRET: ${{ inputs.datadog-api-key-secret }}
+          PROJECT_ID: ${{ inputs.gcp-project-id }}
+          DD_SITE: ${{ inputs.dd-site }}
+          DD_ENV: ${{ inputs.dd_env }}
+          SERVICE: ${{ inputs.service }}
+          SHA: ${{ github.sha }}
+          RUN_URL: "https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+        run: |
+          set -euo pipefail
+          DD_API_KEY=$(gcloud secrets versions access latest --secret="$DD_API_KEY_SECRET" --project="$PROJECT_ID" 2>/dev/null || echo "")
+          echo "::add-mask::${DD_API_KEY}"
+          if [ -z "$DD_API_KEY" ]; then
+            echo "⚠️  ${DD_API_KEY_SECRET} not accessible — skipping Datadog deploy event"
+            exit 0
+          fi
+          SHORT_SHA="${SHA:0:7}"
+          PAYLOAD=$(jq -nc \
+            --arg env "$DD_ENV" \
+            --arg service "$SERVICE" \
+            --arg sha "$SHORT_SHA" \
+            --arg run_url "$RUN_URL" \
+            '{
+              title: "Deploy: \($service) \($env) @ \($sha)",
+              text: "%%% \nDeployed **\($service)** to **\($env)**\n\nCommit: `\($sha)`\nWorkflow: \($run_url)\n %%%",
+              tags: ["env:\($env)", "service:\($service)", "version:\($sha)"],
+              alert_type: "info",
+              source_type_name: "github"
+            }')
+          RESPONSE=$(curl -s -o /tmp/dd_event.json -w '%{http_code}' \
+            -X POST "https://api.${DD_SITE}/api/v1/events" \
+            -H "Content-Type: application/json" \
+            -H "DD-API-KEY: ${DD_API_KEY}" \
+            -d "$PAYLOAD")
+          if [ "$RESPONSE" = "202" ]; then
+            echo "✅ Datadog deploy event sent (env=$DD_ENV sha=${SHA:0:7})"
+          else
+            echo "⚠️  Datadog event returned HTTP $RESPONSE"
+            cat /tmp/dd_event.json 2>/dev/null || true
+          fi
+
+      - name: Purge Cloudflare cache
+        if: inputs.cloudflare-zone-id != ''
+        continue-on-error: true
+        env:
+          CF_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CF_ZONE_ID: ${{ inputs.cloudflare-zone-id }}
+          PURGE_URLS: ${{ inputs.cloudflare-purge-urls }}
+        run: |
+          if [ -z "$CF_API_TOKEN" ]; then
+            echo "⚠️  cloudflare-zone-id is set but CLOUDFLARE_API_TOKEN secret is missing — skipping cache purge"
+            exit 0
+          fi
+          if [ -z "$PURGE_URLS" ]; then
+            echo "⚠️  cloudflare-zone-id is set but cloudflare-purge-urls is empty — skipping cache purge"
+            exit 0
+          fi
+          PAYLOAD=$(python3 -c "import json,os; print(json.dumps({'files': os.environ['PURGE_URLS'].split(',')}))")
+          RESPONSE=$(curl -s -X POST \
+            "https://api.cloudflare.com/client/v4/zones/${CF_ZONE_ID}/purge_cache" \
+            -H "Authorization: Bearer ${CF_API_TOKEN}" \
+            -H "Content-Type: application/json" \
+            -d "$PAYLOAD")
+          SUCCESS=$(echo "$RESPONSE" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('success', False))" 2>/dev/null || echo "false")
+          if [ "$SUCCESS" = "True" ]; then
+            echo "✅ Cloudflare cache purged"
+          else
+            echo "⚠️  Cloudflare cache purge failed: $RESPONSE"
+          fi
 
   smoke-and-rollback:
     name: Smoke & Rollback (${{ inputs.environment }})
@@ -259,6 +409,15 @@ jobs:
             if [ "$HTTP_CODE" = "200" ]; then
               echo "✅ Smoke passed (attempt $i)"
               cat /tmp/health.json
+              # Surface individual check latencies when the health payload has
+              # the { checks: {...} } shape (best-effort — silent no-op otherwise).
+              jq -r '
+                (.checks // {}) | to_entries[] |
+                (.value.status // "?") as $st |
+                (if $st == "ok" then "✅" elif $st == "unconfigured" then "⚠️" else "❌" end) as $icon |
+                (if .value.error then " error=\(.value.error)" else "" end) as $err |
+                "  \($icon) \(.key): \($st) (\(.value.latency_ms // "?")ms)\($err)"
+              ' /tmp/health.json 2>/dev/null || true
               ok=1
               break
             fi
@@ -290,3 +449,104 @@ jobs:
           else
             echo "⚠️  No prior revision recorded — skipping rollback (first deploy?)"
           fi
+
+      - name: Verify deployed revision is serving traffic
+        if: always()
+        continue-on-error: true
+        env:
+          SERVICE: ${{ inputs.service }}
+          REGION: ${{ inputs.gcp-region }}
+          PROJECT_ID: ${{ inputs.gcp-project-id }}
+        run: |
+          set -euo pipefail
+          ACTIVE_REVISION=$(gcloud run services describe "$SERVICE" \
+            --region="$REGION" \
+            --project="$PROJECT_ID" \
+            --format="value(status.traffic[0].revisionName)" 2>/dev/null || echo "")
+          if [ -z "$ACTIVE_REVISION" ]; then
+            echo "⚠️  Could not determine active revision — check deployer SA permissions"
+          else
+            echo "✅ Active revision serving traffic: $ACTIVE_REVISION"
+            READY=$(gcloud run revisions describe "$ACTIVE_REVISION" \
+              --region="$REGION" \
+              --project="$PROJECT_ID" \
+              --format="value(status.conditions[0].status)" 2>/dev/null || echo "Unknown")
+            echo "   Revision ready status: $READY"
+          fi
+
+      - name: Post-deploy log audit (DB errors)
+        if: always() && inputs.enable-log-audit
+        continue-on-error: true
+        env:
+          SERVICE: ${{ inputs.service }}
+          PROJECT_ID: ${{ inputs.gcp-project-id }}
+        run: |
+          echo "Scanning Cloud Run logs for DB errors (last 10 min)..."
+          ENTRIES=$(gcloud logging read \
+            "resource.type=cloud_run_revision \
+             AND resource.labels.service_name=${SERVICE} \
+             AND severity>=ERROR \
+             AND (textPayload=~\"ECONNREFUSED|connect.*refused|auth.*fail|pool.*exhaust|supabase.*error|postgres.*error\" \
+                 OR jsonPayload.message=~\"ECONNREFUSED|connect.*refused|auth.*fail|pool.*exhaust\")" \
+            --freshness=10m \
+            --project="$PROJECT_ID" \
+            --format="json" \
+            --limit=20 2>/dev/null || echo "[]")
+          COUNT=$(echo "$ENTRIES" | python3 -c "import sys,json; print(len(json.load(sys.stdin)))" 2>/dev/null || echo "?")
+          if [ "$COUNT" = "0" ]; then
+            echo "✅ No DB-related errors in Cloud Run logs (last 10 min)"
+          elif [ "$COUNT" = "?" ]; then
+            echo "⚠️  Log read failed — ensure the deployer service account has roles/logging.viewer"
+          else
+            echo "⚠️  Found $COUNT DB-related error entries in the last 10 min:"
+            echo "$ENTRIES" | python3 -c "import sys,json;[print('  ['+e.get('timestamp','?')+'] '+str(e.get('textPayload') or (e.get('jsonPayload') or {}).get('message','?'))[:200]) for e in json.load(sys.stdin)[:5]]"
+          fi
+
+      - name: Emit Mission Control evidence
+        if: always()
+        env:
+          MISSION_CONTROL_URL: ${{ secrets.MISSION_CONTROL_URL }}
+          MISSION_CONTROL_INGEST_TOKEN: ${{ secrets.MISSION_CONTROL_INGEST_TOKEN }}
+          SERVICE: ${{ inputs.service }}
+          ENVIRONMENT: ${{ inputs.environment }}
+          SHA: ${{ github.sha }}
+          SMOKE_RESULT: ${{ steps.smoke.outcome }}
+          PRIOR: ${{ needs.pre-deploy.outputs.prior_revision }}
+          RUN_ID: ${{ github.run_id }}
+          RUN_URL: "https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+        run: |
+          ROLLBACK_TRIGGERED="false"
+          if [ "$SMOKE_RESULT" != "success" ] && [ -n "$PRIOR" ]; then
+            ROLLBACK_TRIGGERED="true"
+          fi
+          jq -n \
+            --arg event "post_deploy_smoke" \
+            --arg service "$SERVICE" \
+            --arg environment "$ENVIRONMENT" \
+            --arg sha "$SHA" \
+            --arg result "$SMOKE_RESULT" \
+            --arg prior_revision "$PRIOR" \
+            --arg rollback_triggered "$ROLLBACK_TRIGGERED" \
+            --arg run_id "$RUN_ID" \
+            --arg run_url "$RUN_URL" \
+            '{event: $event, service: $service, environment: $environment, sha: $sha,
+              result: $result, prior_revision: $prior_revision,
+              rollback_triggered: $rollback_triggered, run_id: $run_id, run_url: $run_url}' \
+            > /tmp/smoke-evidence.json
+          echo "Evidence:"
+          cat /tmp/smoke-evidence.json
+          if [ -n "${MISSION_CONTROL_URL:-}" ]; then
+            curl -sf -X POST "${MISSION_CONTROL_URL}/ingest" \
+              -H "Authorization: Bearer ${MISSION_CONTROL_INGEST_TOKEN}" \
+              -H "Content-Type: application/json" \
+              -d @/tmp/smoke-evidence.json \
+              || echo "⚠️  Mission Control ingest failed (non-blocking)"
+          fi
+
+      - name: Upload smoke evidence artifact
+        if: always()
+        uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5.0.0
+        with:
+          name: smoke-evidence-${{ inputs.environment }}-${{ github.run_id }}
+          path: /tmp/smoke-evidence.json
+          retention-days: 30
