@@ -1,10 +1,28 @@
 name: Promote staging to prod (reusable)
 
-# Fast-forwards main to staging's exact tip — the automated half of the
-# ritual verify-staging-gate.yml's own error message already describes
-# ("3. Fast-forward main to $STAGING_BRANCH (promote)"). Call this from a
-# venture's own thin promote-to-prod.yml wrapper, triggered by
+# Fast-forwards main to a specific, already-tested commit — the automated
+# half of the ritual verify-staging-gate.yml's own error message already
+# describes ("3. Fast-forward main to $STAGING_BRANCH (promote)"). Call
+# this from a venture's own thin promote-to-prod.yml wrapper, triggered by
 # workflow_run once that venture's staging deploy succeeds.
+#
+# Deliberately promotes an EXPLICIT commit-sha input, not "whatever
+# staging's tip happens to be right now." If commit A's staging deploy
+# succeeds but commit B lands on staging before this job actually runs
+# (workflow_run → workflow_call has real latency), promoting the live
+# branch tip would ship B — untested — while verify-staging-gate.yml
+# still accepts it, since it only checks ancestry, not "was THIS commit's
+# own deploy the one that passed." The caller must pass
+# `github.event.workflow_run.head_sha` (the exact commit that triggered
+# the staging run being promoted) as `commit-sha`, not just point at a
+# branch. This job also refuses to run at all unless
+# `triggering-conclusion` is explicitly `"success"` — an internal
+# fail-closed default, not something callers can silently forget to gate
+# on (a `workflow_call` job runs in `workflow_call` context, so it can
+# never see the caller's original `workflow_run.conclusion` unless it's
+# passed in explicitly; this makes that a required, self-enforcing
+# contract instead of a documented-but-unenforced convention every future
+# caller has to remember correctly).
 #
 # Deliberately a fast-forward push, NOT a merge commit. A --no-ff merge
 # creates a brand new commit that descends FROM staging but is never
@@ -13,37 +31,51 @@ name: Promote staging to prod (reusable)
 # every time, by construction. Confirmed the hard way on Simpli: the
 # first real run of an earlier --no-ff version of this promotion produced
 # a commit that its own downstream deploy-prod.yml gate then refused.
-# A fast-forward makes main's tip the exact same SHA as staging's, which
-# trivially satisfies that check (a commit is its own ancestor) — and a
-# no-op fast-forward push (nothing new to promote, e.g. a re-run staging
-# deploy) exits cleanly on its own, no separate guard needed.
+# A fast-forward makes main's tip the exact same SHA as the promoted
+# commit, which trivially satisfies that check (a commit is its own
+# ancestor) — and a no-op fast-forward push (nothing new to promote, e.g.
+# a re-run staging deploy) exits cleanly on its own, no separate guard
+# needed.
 #
 # Needs a PAT, not the default GITHUB_TOKEN — not just for permission,
 # but because pushes made with the default GITHUB_TOKEN don't trigger
 # other workflow runs (GitHub's own anti-loop design). Without a real PAT
 # here, this push would never trigger the venture's deploy-prod.yml at
 # all. Provision one PAT per venture, fine-grained, scoped to that one
-# repo only with Contents: Read and write — not a credential shared
-# across ventures (see gcp-bootstrap's README on why a shared credential
-# reaching every venture's resources is a real mistake, not a
-# hypothetical one).
+# repo only, with BOTH Contents: Read and write AND Workflows: Read and
+# write — the latter is easy to miss, but any staging commit that touches
+# a `.github/workflows/*` file (routine, not exotic — this exact PR is
+# one) gets rejected by GitHub on push without it, since fine-grained PATs
+# gate workflow-file changes separately from general content changes. Not
+# a credential shared across ventures (see gcp-bootstrap's README on why
+# a shared credential reaching every venture's resources is a real
+# mistake, not a hypothetical one).
 
 on:
   workflow_call:
     inputs:
+      commit-sha:
+        description: "The exact commit to promote — pass github.event.workflow_run.head_sha from the caller, not a branch name. Promoting a live branch tip instead risks shipping a different, untested commit if staging moves between the triggering run and this job actually running."
+        required: true
+        type: string
+      triggering-conclusion:
+        description: "Pass github.event.workflow_run.conclusion from the caller when triggered by workflow_run. Promotion is skipped (not failed) unless this is exactly \"success\" — a workflow_dispatch caller with no workflow_run event to reference can leave this at its default."
+        required: false
+        type: string
+        default: "success"
       staging-branch:
-        description: "Branch to promote from"
+        description: "Branch commit-sha is expected to be on (used only for the promoted-to message, not re-verified here — the caller's own trigger already scoped this to a real staging deploy)"
         required: false
         type: string
         default: "staging"
       main-branch:
-        description: "Branch to fast-forward to staging's tip"
+        description: "Branch to fast-forward to commit-sha"
         required: false
         type: string
         default: "main"
     secrets:
       PROMOTE_PAT:
-        description: "Fine-grained PAT scoped to this repo only, Contents: Read and write. Must be a real PAT, not GITHUB_TOKEN — pushes made with the default token don't trigger other workflow runs, so deploy-prod.yml would never fire."
+        description: "Fine-grained PAT scoped to this repo only, with Contents: Read and write AND Workflows: Read and write. Must be a real PAT, not GITHUB_TOKEN — pushes made with the default token don't trigger other workflow runs, so deploy-prod.yml would never fire."
         required: true
 
 permissions:
@@ -51,8 +83,9 @@ permissions:
 
 jobs:
   promote:
-    name: Fast-forward ${{ inputs.main-branch }} to ${{ inputs.staging-branch }}
+    name: Fast-forward ${{ inputs.main-branch }} to ${{ inputs.commit-sha }}
     runs-on: ubuntu-latest
+    if: inputs.triggering-conclusion == 'success'
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -63,11 +96,16 @@ jobs:
           fetch-depth: 0
           token: ${{ secrets.PROMOTE_PAT }}
 
-      - name: Fast-forward main to staging
+      - name: Fast-forward main to the tested commit
         env:
+          COMMIT_SHA: ${{ inputs.commit-sha }}
           STAGING_BRANCH: ${{ inputs.staging-branch }}
           MAIN_BRANCH: ${{ inputs.main-branch }}
         run: |
           set -euo pipefail
-          git push origin "origin/$STAGING_BRANCH:$MAIN_BRANCH"
-          echo "🚀 $MAIN_BRANCH promoted to $(git rev-parse "origin/$STAGING_BRANCH")"
+          if ! git merge-base --is-ancestor "$COMMIT_SHA" "origin/$STAGING_BRANCH"; then
+            echo "::error::$COMMIT_SHA is not on $STAGING_BRANCH — refusing to promote a commit the caller didn't actually get from a staging deploy."
+            exit 1
+          fi
+          git push origin "$COMMIT_SHA:$MAIN_BRANCH"
+          echo "🚀 $MAIN_BRANCH promoted to $COMMIT_SHA (tested on $STAGING_BRANCH)"
