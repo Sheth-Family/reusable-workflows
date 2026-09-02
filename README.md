@@ -84,6 +84,24 @@ same-repo, always correct).
 - `verify-staging-gate.yml` — blocks a prod deploy unless the exact commit
   has already been through staging. Optional; wire in as a `needs:` ahead of
   a deploy job once a venture has a staging environment.
+- `promote-to-prod.yml` — fast-forwards `main` to a specific commit
+  (deliberately NOT a merge commit — see the file's own header for why a
+  `--no-ff` merge always fails `verify-staging-gate.yml`'s ancestry check).
+  Call it from a venture's own thin wrapper, triggered by `workflow_run`
+  once that venture's staging deploy succeeds, passing
+  `commit-sha: ${{ github.event.workflow_run.head_sha }}` and
+  `triggering-conclusion: ${{ github.event.workflow_run.conclusion }}` —
+  promoting the exact tested commit rather than "whatever staging's tip
+  is right now" (which could have moved past the tested commit by the
+  time this job runs), and refusing to run at all unless the triggering
+  conclusion was `"success"`, as a fail-closed default a caller can't
+  forget to add. Needs a `PROMOTE_PAT` secret — a real PAT, not
+  `GITHUB_TOKEN`, since pushes made with the default token don't trigger
+  other workflow runs — with **both** `Contents: Read and write` and
+  `Workflows: Read and write` (any staging commit touching a
+  `.github/workflows/*` file needs the latter, and that's routine, not
+  exotic). Provision one PAT per venture, fine-grained and scoped to that
+  repo only — not a credential shared across ventures.
 - `build-deploy.yml` — build, push to Artifact Registry, run Supabase
   migrations, deploy to Cloud Run, smoke-test, and auto-rollback on smoke
   failure. See the file's own header comment for the full input list and
