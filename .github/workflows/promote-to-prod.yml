@@ -1,0 +1,73 @@
+name: Promote staging to prod (reusable)
+
+# Fast-forwards main to staging's exact tip — the automated half of the
+# ritual verify-staging-gate.yml's own error message already describes
+# ("3. Fast-forward main to $STAGING_BRANCH (promote)"). Call this from a
+# venture's own thin promote-to-prod.yml wrapper, triggered by
+# workflow_run once that venture's staging deploy succeeds.
+#
+# Deliberately a fast-forward push, NOT a merge commit. A --no-ff merge
+# creates a brand new commit that descends FROM staging but is never
+# contained BY it — so verify-staging-gate.yml's ancestry check
+# (git merge-base --is-ancestor $GITHUB_SHA origin/staging) rejects it
+# every time, by construction. Confirmed the hard way on Simpli: the
+# first real run of an earlier --no-ff version of this promotion produced
+# a commit that its own downstream deploy-prod.yml gate then refused.
+# A fast-forward makes main's tip the exact same SHA as staging's, which
+# trivially satisfies that check (a commit is its own ancestor) — and a
+# no-op fast-forward push (nothing new to promote, e.g. a re-run staging
+# deploy) exits cleanly on its own, no separate guard needed.
+#
+# Needs a PAT, not the default GITHUB_TOKEN — not just for permission,
+# but because pushes made with the default GITHUB_TOKEN don't trigger
+# other workflow runs (GitHub's own anti-loop design). Without a real PAT
+# here, this push would never trigger the venture's deploy-prod.yml at
+# all. Provision one PAT per venture, fine-grained, scoped to that one
+# repo only with Contents: Read and write — not a credential shared
+# across ventures (see gcp-bootstrap's README on why a shared credential
+# reaching every venture's resources is a real mistake, not a
+# hypothetical one).
+
+on:
+  workflow_call:
+    inputs:
+      staging-branch:
+        description: "Branch to promote from"
+        required: false
+        type: string
+        default: "staging"
+      main-branch:
+        description: "Branch to fast-forward to staging's tip"
+        required: false
+        type: string
+        default: "main"
+    secrets:
+      PROMOTE_PAT:
+        description: "Fine-grained PAT scoped to this repo only, Contents: Read and write. Must be a real PAT, not GITHUB_TOKEN — pushes made with the default token don't trigger other workflow runs, so deploy-prod.yml would never fire."
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  promote:
+    name: Fast-forward ${{ inputs.main-branch }} to ${{ inputs.staging-branch }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # fetch-depth: 0 fetches every branch, not just whatever ref
+          # gets checked out — the push below operates directly on
+          # remote refs and never needs a local branch checkout, so
+          # which ref actions/checkout lands on doesn't matter here.
+          fetch-depth: 0
+          token: ${{ secrets.PROMOTE_PAT }}
+
+      - name: Fast-forward main to staging
+        env:
+          STAGING_BRANCH: ${{ inputs.staging-branch }}
+          MAIN_BRANCH: ${{ inputs.main-branch }}
+        run: |
+          set -euo pipefail
+          git push origin "origin/$STAGING_BRANCH:$MAIN_BRANCH"
+          echo "🚀 $MAIN_BRANCH promoted to $(git rev-parse "origin/$STAGING_BRANCH")"

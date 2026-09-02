@@ -84,6 +84,15 @@ same-repo, always correct).
 - `verify-staging-gate.yml` — blocks a prod deploy unless the exact commit
   has already been through staging. Optional; wire in as a `needs:` ahead of
   a deploy job once a venture has a staging environment.
+- `promote-to-prod.yml` — fast-forwards `main` to `staging`'s tip
+  (deliberately NOT a merge commit — see the file's own header for why a
+  `--no-ff` merge always fails `verify-staging-gate.yml`'s ancestry check).
+  Call it from a venture's own thin wrapper, triggered by `workflow_run`
+  once that venture's staging deploy succeeds. Needs a `PROMOTE_PAT`
+  secret — a real PAT, not `GITHUB_TOKEN`, since pushes made with the
+  default token don't trigger other workflow runs. Provision one PAT per
+  venture, fine-grained and scoped to that repo only — not a credential
+  shared across ventures.
 - `build-deploy.yml` — build, push to Artifact Registry, run Supabase
   migrations, deploy to Cloud Run, smoke-test, and auto-rollback on smoke
   failure. See the file's own header comment for the full input list and
