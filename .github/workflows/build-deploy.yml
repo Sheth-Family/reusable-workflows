@@ -358,6 +358,7 @@ jobs:
             --max-instances="$MAX_INSTANCES" \
             --set-env-vars="$ENV_VARS" \
             --set-secrets="$SET_SECRETS" \
+            --allow-unauthenticated \
             --quiet
 
       - name: Send deploy event to Datadog
