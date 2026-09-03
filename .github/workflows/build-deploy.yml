@@ -136,6 +136,31 @@ on:
         required: false
         type: boolean
         default: false
+      deploy-scan-job:
+        description: "Deploy/update a Cloud Run Job (for a scan-engine worker) alongside the web service, using the SAME image this workflow just built — no second build/push pipeline. Cloud Run Jobs are CI-owned here, same as the web service itself (gcp-bootstrap never creates the job resource, only outputs the runtime SA identity to grant it execution IAM). False by default — most ventures don't have a scan-engine worker."
+        required: false
+        type: boolean
+        default: false
+      scan-job-name:
+        description: "Cloud Run Job name. Required if deploy-scan-job is true."
+        required: false
+        type: string
+        default: ""
+      scan-job-command:
+        description: "Container ENTRYPOINT override for the scan job, e.g. \"node\". Required if deploy-scan-job is true."
+        required: false
+        type: string
+        default: ""
+      scan-job-args:
+        description: "Comma-separated container CMD args for the scan job, e.g. \"scripts/run-sca-scan.js\". Required if deploy-scan-job is true."
+        required: false
+        type: string
+        default: ""
+      scan-job-runtime-service-account:
+        description: "Email of the identity to grant roles/run.jobsExecutorWithOverrides on this job (the web service's own runtime SA, so it can trigger executions from an API route) — gcp-bootstrap's RUNTIME_SERVICE_ACCOUNT_EMAIL output. Required if deploy-scan-job is true."
+        required: false
+        type: string
+        default: ""
     secrets:
       SUPABASE_ACCESS_TOKEN:
         description: "Supabase Management API token. Required if run-migrations is true."
@@ -400,6 +425,40 @@ jobs:
           # run before the tag existed and silently no-op'd.
           gcloud run services add-iam-policy-binding "$SERVICE" \
             --region="$REGION" --member=allUsers --role=roles/run.invoker --quiet
+
+      - name: Deploy scan job
+        if: inputs.deploy-scan-job == true
+        env:
+          IMAGE: "${{ inputs.gcp-region }}-docker.pkg.dev/${{ inputs.gcp-project-id }}/${{ inputs.gcp-artifact-repo }}/${{ inputs.service }}:${{ github.sha }}"
+          JOB_NAME: ${{ inputs.scan-job-name }}
+          REGION: ${{ inputs.gcp-region }}
+          COMMAND: ${{ inputs.scan-job-command }}
+          JOB_ARGS: ${{ inputs.scan-job-args }}
+          RUNTIME_SA: ${{ inputs.scan-job-runtime-service-account }}
+        run: |
+          set -euo pipefail
+          # `gcloud run jobs deploy` creates on first run, updates on every
+          # later one — same CI-owned pattern as `gcloud run deploy` for the
+          # web service two steps up. Always tracks THIS deploy's image, no
+          # second build/push pipeline.
+          gcloud run jobs deploy "$JOB_NAME" \
+            --image="$IMAGE" \
+            --region="$REGION" \
+            --command="$COMMAND" \
+            --args="$JOB_ARGS" \
+            --max-retries=1 \
+            --task-timeout=600s \
+            --quiet
+          # Lets the web service's own runtime identity trigger executions
+          # of this job from an API route (Cloud Run Admin API, jobs.run)
+          # without granting it anything broader — add-iam-policy-binding
+          # is idempotent on repeat, unlike the tag-bindings create call
+          # above, so no ALREADY_EXISTS handling needed here.
+          gcloud run jobs add-iam-policy-binding "$JOB_NAME" \
+            --region="$REGION" \
+            --member="serviceAccount:${RUNTIME_SA}" \
+            --role=roles/run.jobsExecutorWithOverrides \
+            --quiet
 
       - name: Send deploy event to Datadog
         if: inputs.datadog-api-key-secret != ''
