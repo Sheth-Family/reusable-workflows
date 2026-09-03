@@ -150,79 +150,30 @@ permissions:
   id-token: write
 
 jobs:
-  pre-deploy:
-    name: Capture prior Cloud Run revision
+  # Single, front-of-pipeline job that resolves and validates the
+  # deployer SA once, for every other job to consume via output — not
+  # duplicated per-job. This is deliberately the ONLY job in this
+  # workflow with `environment:` set: a single approval gate (if the
+  # venture's Environment has required reviewers/wait timers configured)
+  # positioned before anything runs, rather than re-gating individual
+  # jobs independently (which could either prompt for approval twice in
+  # one run, or — worse — gate a post-deploy rollback safety net behind
+  # the same protection the deploy itself already passed, potentially
+  # leaving a broken revision serving real traffic while waiting on a
+  # redundant second approval). Every other job needs this one and reads
+  # its resolved value the same way, so pre-deploy's rollback-target
+  # capture and smoke-and-rollback's actual rollback both use the exact
+  # identity build-and-deploy deploys with — not a separately (and
+  # possibly differently) resolved one.
+  resolve-sa:
+    name: Resolve deployer service account
     runs-on: ubuntu-latest
-    # Deliberately no `environment:` here — this job's only GCP call
-    # (below) already tolerates a bad/empty identity gracefully
-    # (`|| echo ""`, treated the same as "no prior revision found: this
-    # is the first deploy"), so unlike build-and-deploy it doesn't need
-    # GCP_DEPLOYER_SA to resolve correctly. Adding environment: here
-    # anyway would gate this job independently, prompting a second
-    # required-review/wait-timer approval (if the venture's Environment
-    # has one configured) before the real deploy even starts — see the
-    # matching reasoning against gating smoke-and-rollback, below.
-    permissions:
-      contents: read
-      id-token: write
-    outputs:
-      prior_revision: ${{ steps.prior.outputs.revision }}
-    steps:
-      - name: Authenticate to GCP (Workload Identity Federation)
-        uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3.0.0
-        with:
-          workload_identity_provider: ${{ inputs.gcp-wif-provider }}
-          service_account: ${{ inputs.service_account }}
-
-      - name: Set up Cloud SDK
-        uses: google-github-actions/setup-gcloud@aa5489c8933f4cc7a4f7d45035b3b1440c9c10db # v3.0.1
-
-      - name: Capture prior revision
-        id: prior
-        env:
-          SERVICE: ${{ inputs.service }}
-          REGION: ${{ inputs.gcp-region }}
-          PROJECT_ID: ${{ inputs.gcp-project-id }}
-        run: |
-          set -uo pipefail
-          REVISION=$(gcloud run revisions list \
-            --service="$SERVICE" \
-            --region="$REGION" \
-            --project="$PROJECT_ID" \
-            --format='value(metadata.name)' \
-            --limit=1 \
-            --sort-by='~metadata.creationTimestamp' 2>/dev/null || echo "")
-          echo "revision=${REVISION}" >> "$GITHUB_OUTPUT"
-          echo "Prior revision: ${REVISION:-<none — first deploy>}"
-
-  build-and-deploy:
-    name: Build and deploy (${{ inputs.environment }})
-    needs: pre-deploy
-    runs-on: ubuntu-latest
-    # Activates this job's Environment context so `vars.GCP_DEPLOYER_SA`
-    # below resolves correctly — see the "Resolve deployer service
-    # account" step for the full explanation. This is the only job in
-    # this workflow that hard-fails on a bad identity (the others tolerate
-    # it gracefully already), and the only place this fix touches
-    # `environment:` — smoke-and-rollback intentionally consumes this
-    # job's resolved value via output instead of also declaring
-    # `environment:` itself, since re-gating a post-deploy safety net
-    # behind the same required-review/wait-timer protection the deploy
-    # itself already passed could leave a broken revision serving real
-    # traffic while waiting on a redundant approval (Codex review finding,
-    # PR #3).
     environment: ${{ inputs.environment }}
     outputs:
-      deployer-sa: ${{ steps.resolve-sa.outputs.value }}
+      value: ${{ steps.resolve.outputs.value }}
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-
-      - name: Run pre-deploy tests
-        if: inputs.test-command != ''
-        run: ${{ inputs.test-command }}
-
       - name: Resolve deployer service account
-        id: resolve-sa
+        id: resolve
         env:
           INPUT_SA: ${{ inputs.service_account }}
           VARS_SA: ${{ vars.GCP_DEPLOYER_SA }}
@@ -254,11 +205,59 @@ jobs:
           fi
           echo "value=${VALUE}" >> "$GITHUB_OUTPUT"
 
+  pre-deploy:
+    name: Capture prior Cloud Run revision
+    needs: resolve-sa
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    outputs:
+      prior_revision: ${{ steps.prior.outputs.revision }}
+    steps:
       - name: Authenticate to GCP (Workload Identity Federation)
         uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3.0.0
         with:
           workload_identity_provider: ${{ inputs.gcp-wif-provider }}
-          service_account: ${{ steps.resolve-sa.outputs.value }}
+          service_account: ${{ needs.resolve-sa.outputs.value }}
+
+      - name: Set up Cloud SDK
+        uses: google-github-actions/setup-gcloud@aa5489c8933f4cc7a4f7d45035b3b1440c9c10db # v3.0.1
+
+      - name: Capture prior revision
+        id: prior
+        env:
+          SERVICE: ${{ inputs.service }}
+          REGION: ${{ inputs.gcp-region }}
+          PROJECT_ID: ${{ inputs.gcp-project-id }}
+        run: |
+          set -uo pipefail
+          REVISION=$(gcloud run revisions list \
+            --service="$SERVICE" \
+            --region="$REGION" \
+            --project="$PROJECT_ID" \
+            --format='value(metadata.name)' \
+            --limit=1 \
+            --sort-by='~metadata.creationTimestamp' 2>/dev/null || echo "")
+          echo "revision=${REVISION}" >> "$GITHUB_OUTPUT"
+          echo "Prior revision: ${REVISION:-<none — first deploy>}"
+
+  build-and-deploy:
+    name: Build and deploy (${{ inputs.environment }})
+    needs: [resolve-sa, pre-deploy]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Run pre-deploy tests
+        if: inputs.test-command != ''
+        run: ${{ inputs.test-command }}
+
+      - name: Authenticate to GCP (Workload Identity Federation)
+        uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3.0.0
+        with:
+          workload_identity_provider: ${{ inputs.gcp-wif-provider }}
+          service_account: ${{ needs.resolve-sa.outputs.value }}
 
       - name: Set up Cloud SDK
         uses: google-github-actions/setup-gcloud@aa5489c8933f4cc7a4f7d45035b3b1440c9c10db # v3.0.1
@@ -433,18 +432,16 @@ jobs:
 
   smoke-and-rollback:
     name: Smoke & Rollback (${{ inputs.environment }})
-    needs: [pre-deploy, build-and-deploy]
+    needs: [resolve-sa, pre-deploy, build-and-deploy]
     if: inputs.enable-smoke-and-rollback
     runs-on: ubuntu-latest
-    # Deliberately no `environment:` here — this job is a post-deploy
-    # safety net that must be able to run and roll back immediately if
-    # build-and-deploy's own Environment gate (required reviewers, wait
-    # timers, ...) already passed. Re-declaring environment: here would
-    # gate this job independently, potentially leaving a broken Cloud
-    # Run revision serving real traffic while waiting on a second,
-    # redundant approval (Codex review finding, PR #3). Consumes
-    # build-and-deploy's already-resolved value via output instead of
-    # re-resolving vars.GCP_DEPLOYER_SA itself.
+    # Deliberately no `environment:` here — resolve-sa is the single,
+    # front-of-pipeline gate for the whole workflow run (see its own
+    # comment). This job is also a post-deploy safety net that must be
+    # able to roll back immediately once build-and-deploy has run;
+    # re-gating it independently here could leave a broken Cloud Run
+    # revision serving real traffic while waiting on a redundant second
+    # approval (Codex review finding, PR #3).
     permissions:
       contents: read
       id-token: write
@@ -453,7 +450,7 @@ jobs:
         uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3.0.0
         with:
           workload_identity_provider: ${{ inputs.gcp-wif-provider }}
-          service_account: ${{ needs.build-and-deploy.outputs.deployer-sa }}
+          service_account: ${{ needs.resolve-sa.outputs.value }}
 
       - name: Set up Cloud SDK
         uses: google-github-actions/setup-gcloud@aa5489c8933f4cc7a4f7d45035b3b1440c9c10db # v3.0.1
