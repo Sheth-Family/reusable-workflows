@@ -150,54 +150,51 @@ permissions:
   id-token: write
 
 jobs:
-  # Single, front-of-pipeline job that resolves and validates the
-  # deployer SA once, for every other job to consume via output — not
-  # duplicated per-job. This is deliberately the ONLY job in this
-  # workflow with `environment:` set: a single approval gate (if the
-  # venture's Environment has required reviewers/wait timers configured)
-  # positioned before anything runs, rather than re-gating individual
-  # jobs independently (which could either prompt for approval twice in
-  # one run, or — worse — gate a post-deploy rollback safety net behind
-  # the same protection the deploy itself already passed, potentially
-  # leaving a broken revision serving real traffic while waiting on a
-  # redundant second approval). Every other job needs this one and reads
-  # its resolved value the same way, so pre-deploy's rollback-target
-  # capture and smoke-and-rollback's actual rollback both use the exact
-  # identity build-and-deploy deploys with — not a separately (and
-  # possibly differently) resolved one.
-  resolve-sa:
-    name: Resolve deployer service account
+  pre-deploy:
+    name: Capture prior Cloud Run revision
     runs-on: ubuntu-latest
+    # See the "Resolve deployer service account" step below for why this
+    # is here — each job that authenticates to GCP declares its own
+    # `environment:` and resolves the fallback independently, rather
+    # than funneling through one shared resolver job. An earlier attempt
+    # centralized this into a single upstream job, but that broke two
+    # things a per-job resolution avoids: the OIDC token each job mints
+    # for `google-github-actions/auth` carries an environment-scoped
+    # subject claim only when *that job itself* has `environment:` set
+    # (GCP WIF trust policies can require this), and any
+    # Environment-scoped secrets a job's own steps read (e.g.
+    # SUPABASE_ACCESS_TOKEN, CLOUDFLARE_API_TOKEN, if a venture sets
+    # them at the Environment level rather than repo level) are only
+    # available to a job with that Environment active (Codex review
+    # findings, PR #3). Some duplication across the three jobs below is
+    # the accepted tradeoff — it's confined to this one file, unlike the
+    # cross-repo duplication a resolver job in every calling venture's
+    # deploy-staging.yml would have caused (an earlier, rejected attempt
+    # at this same fix).
     environment: ${{ inputs.environment }}
+    permissions:
+      contents: read
+      id-token: write
     outputs:
-      value: ${{ steps.resolve.outputs.value }}
+      prior_revision: ${{ steps.prior.outputs.revision }}
     steps:
       - name: Resolve deployer service account
-        id: resolve
+        id: resolve-sa
         env:
           INPUT_SA: ${{ inputs.service_account }}
           VARS_SA: ${{ vars.GCP_DEPLOYER_SA }}
         run: |
           set -euo pipefail
-          # Falls back to the calling repo's own Environment-scoped
-          # GCP_DEPLOYER_SA variable (set by gcp-bootstrap's
-          # wire-github.sh) when a caller doesn't pass service_account
-          # explicitly. A caller's own `${{ vars.GCP_DEPLOYER_SA }}`
-          # reference resolves to empty at ITS OWN job context unless
-          # that job also has `environment:` set — which a job calling
-          # a reusable workflow via `uses:` isn't allowed to declare
-          # (actionlint-enforced) — so resolving it here instead, where
-          # this job's own `environment:` above makes it work, is the
-          # correct fix rather than duplicating a resolver job in every
-          # calling repo.
-          #
-          # Fails loudly rather than silently authenticating as the bare
-          # WIF principal (no roles of its own) if BOTH are empty —
-          # confirmed live (2026-09-02/03, wearesentinull/sentinull) that
-          # an unresolved empty service_account turns a call-time
-          # configuration error into a confusing late deployment failure:
-          # the build succeeds, but every subsequent GCP operation is
-          # denied in a way that looks exactly like IAM propagation lag.
+          # Falls back to this Environment's own GCP_DEPLOYER_SA
+          # variable (set by gcp-bootstrap's wire-github.sh) when a
+          # caller doesn't pass service_account explicitly. Fails loudly
+          # rather than silently authenticating as the bare WIF principal
+          # (no roles of its own) if BOTH are empty — confirmed live
+          # (2026-09-02/03, wearesentinull/sentinull) that an unresolved
+          # empty service_account turns a call-time configuration error
+          # into a confusing late deployment failure: the build succeeds,
+          # but every subsequent GCP operation is denied in a way that
+          # looks exactly like IAM propagation lag.
           VALUE="${INPUT_SA:-$VARS_SA}"
           if [ -z "$VALUE" ]; then
             echo "::error::No service_account input was provided, and this environment's GCP_DEPLOYER_SA variable is also empty or unset. Set one or the other before deploying."
@@ -205,21 +202,11 @@ jobs:
           fi
           echo "value=${VALUE}" >> "$GITHUB_OUTPUT"
 
-  pre-deploy:
-    name: Capture prior Cloud Run revision
-    needs: resolve-sa
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      id-token: write
-    outputs:
-      prior_revision: ${{ steps.prior.outputs.revision }}
-    steps:
       - name: Authenticate to GCP (Workload Identity Federation)
         uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3.0.0
         with:
           workload_identity_provider: ${{ inputs.gcp-wif-provider }}
-          service_account: ${{ needs.resolve-sa.outputs.value }}
+          service_account: ${{ steps.resolve-sa.outputs.value }}
 
       - name: Set up Cloud SDK
         uses: google-github-actions/setup-gcloud@aa5489c8933f4cc7a4f7d45035b3b1440c9c10db # v3.0.1
@@ -244,8 +231,10 @@ jobs:
 
   build-and-deploy:
     name: Build and deploy (${{ inputs.environment }})
-    needs: [resolve-sa, pre-deploy]
+    needs: pre-deploy
     runs-on: ubuntu-latest
+    # See the comment on pre-deploy's environment: above.
+    environment: ${{ inputs.environment }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
@@ -253,11 +242,25 @@ jobs:
         if: inputs.test-command != ''
         run: ${{ inputs.test-command }}
 
+      - name: Resolve deployer service account
+        id: resolve-sa
+        env:
+          INPUT_SA: ${{ inputs.service_account }}
+          VARS_SA: ${{ vars.GCP_DEPLOYER_SA }}
+        run: |
+          set -euo pipefail
+          VALUE="${INPUT_SA:-$VARS_SA}"
+          if [ -z "$VALUE" ]; then
+            echo "::error::No service_account input was provided, and this environment's GCP_DEPLOYER_SA variable is also empty or unset. Set one or the other before deploying."
+            exit 1
+          fi
+          echo "value=${VALUE}" >> "$GITHUB_OUTPUT"
+
       - name: Authenticate to GCP (Workload Identity Federation)
         uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3.0.0
         with:
           workload_identity_provider: ${{ inputs.gcp-wif-provider }}
-          service_account: ${{ needs.resolve-sa.outputs.value }}
+          service_account: ${{ steps.resolve-sa.outputs.value }}
 
       - name: Set up Cloud SDK
         uses: google-github-actions/setup-gcloud@aa5489c8933f4cc7a4f7d45035b3b1440c9c10db # v3.0.1
@@ -432,25 +435,42 @@ jobs:
 
   smoke-and-rollback:
     name: Smoke & Rollback (${{ inputs.environment }})
-    needs: [resolve-sa, pre-deploy, build-and-deploy]
+    needs: [pre-deploy, build-and-deploy]
     if: inputs.enable-smoke-and-rollback
     runs-on: ubuntu-latest
-    # Deliberately no `environment:` here — resolve-sa is the single,
-    # front-of-pipeline gate for the whole workflow run (see its own
-    # comment). This job is also a post-deploy safety net that must be
-    # able to roll back immediately once build-and-deploy has run;
-    # re-gating it independently here could leave a broken Cloud Run
-    # revision serving real traffic while waiting on a redundant second
-    # approval (Codex review finding, PR #3).
+    # See the comment on pre-deploy's environment: above. This job is a
+    # post-deploy safety net — accepting the (currently theoretical, for
+    # every venture's Environments today have zero protection rules
+    # configured) risk that a future required-reviewer/wait-timer
+    # protection rule would gate it a second time, in exchange for
+    # correct OIDC subject claims and Environment-scoped secrets access,
+    # which actually broke when an earlier attempt at this fix removed
+    # environment: to avoid exactly that theoretical risk (Codex review
+    # findings, PR #3).
+    environment: ${{ inputs.environment }}
     permissions:
       contents: read
       id-token: write
     steps:
+      - name: Resolve deployer service account
+        id: resolve-sa
+        env:
+          INPUT_SA: ${{ inputs.service_account }}
+          VARS_SA: ${{ vars.GCP_DEPLOYER_SA }}
+        run: |
+          set -euo pipefail
+          VALUE="${INPUT_SA:-$VARS_SA}"
+          if [ -z "$VALUE" ]; then
+            echo "::error::No service_account input was provided, and this environment's GCP_DEPLOYER_SA variable is also empty or unset. Set one or the other before deploying."
+            exit 1
+          fi
+          echo "value=${VALUE}" >> "$GITHUB_OUTPUT"
+
       - name: Authenticate to GCP (Workload Identity Federation)
         uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3.0.0
         with:
           workload_identity_provider: ${{ inputs.gcp-wif-provider }}
-          service_account: ${{ needs.resolve-sa.outputs.value }}
+          service_account: ${{ steps.resolve-sa.outputs.value }}
 
       - name: Set up Cloud SDK
         uses: google-github-actions/setup-gcloud@aa5489c8933f4cc7a4f7d45035b3b1440c9c10db # v3.0.1
