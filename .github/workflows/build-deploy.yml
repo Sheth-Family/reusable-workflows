@@ -452,12 +452,21 @@ jobs:
           # This is a SEPARATE Cloud Run resource from the web service —
           # its own env/secrets config, not inherited from set_secrets/
           # extra-env-vars above.
+          # Explicitly clear when empty, not just omit the flag — a bare
+          # omission leaves gcloud run jobs deploy's default behavior of
+          # preserving whatever was set on a PRIOR deploy in place, so a
+          # caller that removes a secret from its own config would
+          # otherwise leave it mounted on the job forever.
           EXTRA_FLAGS=()
           if [ -n "$JOB_SECRETS" ]; then
             EXTRA_FLAGS+=(--set-secrets="$JOB_SECRETS")
+          else
+            EXTRA_FLAGS+=(--clear-secrets)
           fi
           if [ -n "$JOB_ENV_VARS" ]; then
             EXTRA_FLAGS+=(--set-env-vars="$JOB_ENV_VARS")
+          else
+            EXTRA_FLAGS+=(--clear-env-vars)
           fi
           # `gcloud run jobs deploy` creates on first run, updates on every
           # later one — same CI-owned pattern as `gcloud run deploy` for the
