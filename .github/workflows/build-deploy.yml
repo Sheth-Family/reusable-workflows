@@ -131,6 +131,11 @@ on:
         required: false
         type: boolean
         default: false
+      public-via-load-balancer:
+        description: "Serve this service publicly through an External HTTPS Load Balancer instead of Cloud Run's direct allUsers-invoker pattern — required for any venture created since the org's Domain Restricted Sharing policy took effect (see gcp-bootstrap's create_load_balancer / README \"Org-level prerequisites\"). When true: ingress is restricted to internal-and-cloud-load-balancing (the direct *.run.app URL stops responding — health-check-url must point at the LB's domain, not *.run.app), the service is tagged allUsersIngress=True, and allUsers is granted roles/run.invoker (now permitted only for this tagged, ingress-locked resource). False (default) preserves the old direct-Cloud-Run behavior unchanged — e.g. Simpli's grandfathered setup."
+        required: false
+        type: boolean
+        default: false
     secrets:
       SUPABASE_ACCESS_TOKEN:
         description: "Supabase Management API token. Required if run-migrations is true."
@@ -346,11 +351,23 @@ jobs:
           DD_ENV: ${{ inputs.dd_env }}
           SET_SECRETS: ${{ inputs.set_secrets }}
           EXTRA_ENV_VARS: ${{ inputs.extra-env-vars }}
+          PUBLIC_VIA_LB: ${{ inputs.public-via-load-balancer }}
         run: |
           set -euo pipefail
           ENV_VARS="NEXT_PUBLIC_ENV=${NEXT_PUBLIC_ENV},DD_ENV=${DD_ENV}"
           if [ -n "$EXTRA_ENV_VARS" ]; then
             ENV_VARS="${ENV_VARS},${EXTRA_ENV_VARS}"
+          fi
+          # allUsers-invoker (below) is a Domain Restricted Sharing no-op
+          # for any project created since 2026-09-01 — see gcp-bootstrap's
+          # README "Org-level prerequisites". public-via-load-balancer
+          # replaces it with the DRS-compatible pattern instead of setting
+          # --allow-unauthenticated here; the direct *.run.app URL becomes
+          # unreachable once ingress is restricted below, by design.
+          if [ "$PUBLIC_VIA_LB" = "true" ]; then
+            INGRESS_FLAG=(--ingress=internal-and-cloud-load-balancing)
+          else
+            INGRESS_FLAG=()
           fi
           gcloud run deploy "$SERVICE" \
             --image="$IMAGE" \
@@ -358,8 +375,31 @@ jobs:
             --max-instances="$MAX_INSTANCES" \
             --set-env-vars="$ENV_VARS" \
             --set-secrets="$SET_SECRETS" \
-            --allow-unauthenticated \
+            "${INGRESS_FLAG[@]}" \
             --quiet
+
+      - name: Configure public access via Load Balancer
+        if: inputs.public-via-load-balancer == true
+        env:
+          SERVICE: ${{ inputs.service }}
+          REGION: ${{ inputs.gcp-region }}
+          PROJECT_ID: ${{ inputs.gcp-project-id }}
+        run: |
+          set -euo pipefail
+          # Idempotent: tolerate an already-existing binding from a prior
+          # deploy of this same service.
+          if ! gcloud resource-manager tags bindings create \
+            --tag-value=143642315492/allUsersIngress/True \
+            --parent="//run.googleapis.com/projects/${PROJECT_ID}/locations/${REGION}/services/${SERVICE}" \
+            --location="$REGION" --quiet 2>err.log; then
+            grep -q ALREADY_EXISTS err.log || { cat err.log; exit 1; }
+          fi
+          # Now permitted by the org's conditional DRS exemption, since
+          # the service above is tagged AND ingress-restricted — a plain
+          # --allow-unauthenticated on the earlier deploy step would have
+          # run before the tag existed and silently no-op'd.
+          gcloud run services add-iam-policy-binding "$SERVICE" \
+            --region="$REGION" --member=allUsers --role=roles/run.invoker --quiet
 
       - name: Send deploy event to Datadog
         if: inputs.datadog-api-key-secret != ''
