@@ -69,6 +69,23 @@ bare `vars.X` reference inside any workflow in this repo — pass it in from
 the caller, which resolves its own `vars.X` at the call site (unambiguously
 same-repo, always correct).
 
+**One narrow, deliberate exception:** `build-deploy.yml`'s `service_account`
+input falls back to `${{ vars.GCP_DEPLOYER_SA }}` read from *inside* its own
+jobs, each of which has `environment: ${{ inputs.environment }}` set. This
+exists because the natural fix — the *caller's* job resolving its own
+`vars.GCP_DEPLOYER_SA` and passing it in, exactly like every other input
+here — doesn't work for this specific variable: it's Environment-scoped
+(set per staging/prod by `gcp-bootstrap`'s `wire-github.sh`), and a caller
+job that itself calls a reusable workflow via `uses:` isn't allowed to also
+declare `environment:` (actionlint-enforced), so it has no Environment
+context to resolve an Environment-scoped variable from at all. Reading it
+inside this workflow's own Environment-scoped jobs instead is the only way
+to get a correct value — status as of 2026-09-03: reasoned through and
+code-reviewed, not yet confirmed by a real deploy. This note will be
+updated once one has. Don't treat this as license to add other bare
+`vars.X` reads here — this is a workaround for one specific, unusual
+constraint, not a general pattern.
+
 ## What's here
 
 - `ci-checks.yml` — typecheck, lint, `npm audit --audit-level=high`. Takes a
