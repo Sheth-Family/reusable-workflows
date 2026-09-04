@@ -10,6 +10,21 @@ name: CI — Type check, Lint, Audit (reusable)
 # Pins an explicit Node version rather than relying on whatever the runner
 # image happens to preinstall — that drifted silently in the original
 # non-reusable version of this workflow (template-fullstack-app history).
+#
+# Also pins an explicit npm version (see the "Upgrade npm" step) — npm
+# retired its legacy /-/npm/v1/security/audits/quick endpoint (brownout
+# from 2026-04-15, full HTTP 410 retirement from 2026-07-15) in favor of
+# /-/npm/v1/security/advisories/bulk. Whatever npm version ships bundled
+# with actions/setup-node's resolved Node 22.x build predates that
+# migration and calls the dead endpoint, so `npm audit` here started
+# failing outright (HTTP 400/410, "Invalid package tree") across every
+# venture using this workflow. Confirmed npm@11.19.1 calls the new
+# endpoint successfully; pinned explicitly rather than `npm install -g
+# npm@latest`, matching this file's existing pin-everything discipline.
+# npm@11.19.1 itself requires Node ^20.17.0 || >=22.9.0 — the default
+# node-version ("22") satisfies that, but node-version is caller-
+# overridable, so the upgrade step checks compatibility first rather
+# than assuming every caller is on a new-enough Node.
 
 on:
   workflow_call:
@@ -35,6 +50,25 @@ jobs:
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: ${{ inputs.node-version }}
+
+      - name: Upgrade npm
+        run: |
+          # npm@11.19.1 requires Node ^20.17.0 || >=22.9.0. A caller on an
+          # older node-version would otherwise get a NEW failure from this
+          # upgrade itself (running under an unsupported npm/Node combo)
+          # on top of the pre-existing retired-endpoint one — skip instead,
+          # leaving that caller exactly as broken as before this fix until
+          # they bump their own node-version, never worse.
+          COMPATIBLE=$(node -e "
+            const [maj, min] = process.versions.node.split('.').map(Number);
+            const ok = (maj === 20 && min >= 17) || (maj === 22 && min >= 9) || maj > 22;
+            console.log(ok);
+          ")
+          if [ "$COMPATIBLE" = "true" ]; then
+            npm install -g npm@11.19.1
+          else
+            echo "::warning::Node $(node -v) doesn't support npm@11.19.1 (requires ^20.17.0 || >=22.9.0) — skipping the npm upgrade. The audit step will likely still fail against npm's retired legacy endpoint until this venture's node-version input is bumped to a supported release."
+          fi
 
       - name: Install dependencies
         run: npm ci
