@@ -171,6 +171,41 @@ on:
         required: false
         type: string
         default: ""
+      deploy-dispatcher-job:
+        description: "Deploy/update a SECOND, independent Cloud Run Job (for a scheduler-triggered batch dispatcher, e.g. a runbooks/automation worker) alongside the web service and any scan job, using the SAME image this workflow just built. Same CI-owned, gcp-bootstrap-never-creates-the-resource pattern as deploy-scan-job — this is a genuinely separate job (own name/command/args/secrets), not a variant of the scan job, since the two can have completely different entrypoints and env needs. False by default."
+        required: false
+        type: boolean
+        default: false
+      dispatcher-job-name:
+        description: "Cloud Run Job name. Required if deploy-dispatcher-job is true."
+        required: false
+        type: string
+        default: ""
+      dispatcher-job-command:
+        description: "Container ENTRYPOINT override for the dispatcher job, e.g. \"node\". Required if deploy-dispatcher-job is true."
+        required: false
+        type: string
+        default: ""
+      dispatcher-job-args:
+        description: "Comma-separated container CMD args for the dispatcher job, e.g. \"dist/run-runbook-dispatcher.js\". Required if deploy-dispatcher-job is true."
+        required: false
+        type: string
+        default: ""
+      dispatcher-job-runtime-service-account:
+        description: "Email of the identity to grant roles/run.jobsExecutorWithOverrides on this job — typically a DEDICATED scheduler-invoker SA (not the web service's own runtime SA), since a dispatcher job is normally triggered by Cloud Scheduler, not an API route. Required if deploy-dispatcher-job is true."
+        required: false
+        type: string
+        default: ""
+      dispatcher-job-set-secrets:
+        description: "Comma-separated SECRET_ENV_NAME=gcp-secret-name:version pairs for the dispatcher job's OWN container — same format as scan-job-set-secrets, its own separate Cloud Run resource with its own env config."
+        required: false
+        type: string
+        default: ""
+      dispatcher-job-set-env-vars:
+        description: "Comma-separated plain KEY=value pairs (not secrets) for the dispatcher job's own container."
+        required: false
+        type: string
+        default: ""
     secrets:
       SUPABASE_ACCESS_TOKEN:
         description: "Supabase Management API token. Required if run-migrations is true."
@@ -486,6 +521,54 @@ jobs:
           # without granting it anything broader — add-iam-policy-binding
           # is idempotent on repeat, unlike the tag-bindings create call
           # above, so no ALREADY_EXISTS handling needed here.
+          gcloud run jobs add-iam-policy-binding "$JOB_NAME" \
+            --region="$REGION" \
+            --member="serviceAccount:${RUNTIME_SA}" \
+            --role=roles/run.jobsExecutorWithOverrides \
+            --quiet
+
+      - name: Deploy dispatcher job
+        if: inputs.deploy-dispatcher-job == true
+        env:
+          IMAGE: "${{ inputs.gcp-region }}-docker.pkg.dev/${{ inputs.gcp-project-id }}/${{ inputs.gcp-artifact-repo }}/${{ inputs.service }}:${{ github.sha }}"
+          JOB_NAME: ${{ inputs.dispatcher-job-name }}
+          REGION: ${{ inputs.gcp-region }}
+          COMMAND: ${{ inputs.dispatcher-job-command }}
+          JOB_ARGS: ${{ inputs.dispatcher-job-args }}
+          RUNTIME_SA: ${{ inputs.dispatcher-job-runtime-service-account }}
+          JOB_SECRETS: ${{ inputs.dispatcher-job-set-secrets }}
+          JOB_ENV_VARS: ${{ inputs.dispatcher-job-set-env-vars }}
+        run: |
+          set -euo pipefail
+          # Identical shape to "Deploy scan job" above (same image, same
+          # create-or-update semantics, same explicit-clear-when-empty
+          # reasoning) — a genuinely separate Cloud Run resource, not a
+          # variant of the scan job, so it gets its own named input block
+          # rather than being folded into deploy-scan-job's.
+          EXTRA_FLAGS=()
+          if [ -n "$JOB_SECRETS" ]; then
+            EXTRA_FLAGS+=(--set-secrets="$JOB_SECRETS")
+          else
+            EXTRA_FLAGS+=(--clear-secrets)
+          fi
+          if [ -n "$JOB_ENV_VARS" ]; then
+            EXTRA_FLAGS+=(--set-env-vars="$JOB_ENV_VARS")
+          else
+            EXTRA_FLAGS+=(--clear-env-vars)
+          fi
+          gcloud run jobs deploy "$JOB_NAME" \
+            --image="$IMAGE" \
+            --region="$REGION" \
+            --command="$COMMAND" \
+            --args="$JOB_ARGS" \
+            --max-retries=1 \
+            --task-timeout=600s \
+            "${EXTRA_FLAGS[@]}" \
+            --quiet
+          # Grants whatever identity actually triggers this job (typically
+          # a dedicated Cloud Scheduler invoker SA, not the web service's
+          # own runtime SA — see this input's own description) permission
+          # to call jobs.run, nothing broader.
           gcloud run jobs add-iam-policy-binding "$JOB_NAME" \
             --region="$REGION" \
             --member="serviceAccount:${RUNTIME_SA}" \
