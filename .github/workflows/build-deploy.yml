@@ -197,7 +197,7 @@ on:
         type: string
         default: ""
       dispatcher-job-execution-service-account:
-        description: "Email of the service account the job's OWN CONTAINER runs as when executing (passed as gcloud run jobs deploy --service-account) — a completely different concern from dispatcher-job-runtime-service-account above, which only grants some OTHER identity permission to invoke this job. Neither the scan job's nor this job's deploy step has ever set --service-account before this input existed, so both were silently running as the project's bare default compute service account — harmless for a scan job that only needs data-plane secrets (Supabase/GitHub), but insufficient for a dispatcher whose own code calls the Cloud Run Admin API (e.g. to trigger a scan job execution), since that call is authenticated as whatever identity the CALLING job's container itself runs as, via the metadata server. Optional and empty by default, preserving the pre-existing (undocumented) default-compute-SA behavior for any consumer that doesn't need this; a dispatcher that calls back into another Cloud Run Job should set this to an identity already granted the appropriate role on that target job (e.g. the same SA passed as scan-job-runtime-service-account, so the dispatcher can trigger the scan job with the identical grant the web service already relies on)."
+        description: "Email of the service account the job's OWN CONTAINER runs as when executing (passed as gcloud run jobs deploy --service-account) — a completely different concern from dispatcher-job-runtime-service-account above, which only grants some OTHER identity permission to invoke this job. Neither the scan job's nor this job's deploy step has ever set --service-account before this input existed, so both were silently running as the project's bare default compute service account — harmless for a scan job that only needs data-plane secrets (Supabase/GitHub), but insufficient for a dispatcher whose own code calls the Cloud Run Admin API (e.g. to trigger a scan job execution), since that call is authenticated as whatever identity the CALLING job's container itself runs as, via the metadata server. Optional; empty means the job runs as the project's default compute service account — the deploy step resolves and passes that identity EXPLICITLY on every deploy (not merely by omitting the flag), so clearing this input after previously setting it genuinely resets the job's execution identity on the next deploy, rather than silently leaving a stale, possibly-privileged SA attached from an earlier deploy. A dispatcher that calls back into another Cloud Run Job should set this to an identity already granted the appropriate role on that target job (e.g. the same SA passed as scan-job-runtime-service-account, so the dispatcher can trigger the scan job with the identical grant the web service already relies on)."
         required: false
         type: string
         default: ""
@@ -580,6 +580,7 @@ jobs:
           IMAGE: "${{ inputs.gcp-region }}-docker.pkg.dev/${{ inputs.gcp-project-id }}/${{ inputs.gcp-artifact-repo }}/${{ inputs.service }}:${{ github.sha }}"
           JOB_NAME: ${{ inputs.dispatcher-job-name }}
           REGION: ${{ inputs.gcp-region }}
+          PROJECT_ID: ${{ inputs.gcp-project-id }}
           COMMAND: ${{ inputs.dispatcher-job-command }}
           JOB_ARGS: ${{ inputs.dispatcher-job-args }}
           RUNTIME_SA: ${{ inputs.dispatcher-job-runtime-service-account }}
@@ -615,15 +616,25 @@ jobs:
           else
             EXTRA_FLAGS+=(--clear-env-vars)
           fi
-          # Only pass --service-account when explicitly given — an empty
-          # value here must NOT translate into an explicit
-          # --service-account="" (gcloud would reject that outright);
-          # omitting the flag entirely preserves gcloud's own default
-          # behavior (project default compute SA on first creation,
-          # whatever was already set on a later update), matching every
-          # other optional flag in this step's own EXTRA_FLAGS pattern.
+          # Always pass --service-account explicitly, never omit it —
+          # unlike JOB_SECRETS/JOB_ENV_VARS above, omitting this flag on an
+          # UPDATE preserves whatever identity was already attached from a
+          # PRIOR deploy (gcloud run jobs deploy reference: "Service
+          # account associated with the revision of the Job"), so a caller
+          # that sets EXEC_SA once and later removes it would otherwise
+          # leave that old, possibly-privileged identity attached
+          # indefinitely — silently contradicting this input's own
+          # description that empty means "the project's default compute
+          # service account" (Codex-caught, PR #10 round 1). Resolving and
+          # passing the REAL default compute SA explicitly, exactly the
+          # identity gcloud itself would assign on a first-ever create,
+          # makes "empty" behave identically whether this is a create or
+          # an update.
           if [ -n "$EXEC_SA" ]; then
             EXTRA_FLAGS+=(--service-account="$EXEC_SA")
+          else
+            PROJECT_NUMBER=$(gcloud projects describe "$PROJECT_ID" --format='value(projectNumber)')
+            EXTRA_FLAGS+=(--service-account="${PROJECT_NUMBER}-compute@developer.gserviceaccount.com")
           fi
           gcloud run jobs deploy "$JOB_NAME" \
             --image="$IMAGE" \
