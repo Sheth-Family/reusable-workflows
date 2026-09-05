@@ -171,6 +171,41 @@ on:
         required: false
         type: string
         default: ""
+      deploy-dispatcher-job:
+        description: "Deploy/update a SECOND, independent Cloud Run Job (for a scheduler-triggered batch dispatcher, e.g. a runbooks/automation worker) alongside the web service and any scan job, using the SAME image this workflow just built. Same CI-owned, gcp-bootstrap-never-creates-the-resource pattern as deploy-scan-job — this is a genuinely separate job (own name/command/args/secrets), not a variant of the scan job, since the two can have completely different entrypoints and env needs. False by default."
+        required: false
+        type: boolean
+        default: false
+      dispatcher-job-name:
+        description: "Cloud Run Job name. Required if deploy-dispatcher-job is true."
+        required: false
+        type: string
+        default: ""
+      dispatcher-job-command:
+        description: "Container ENTRYPOINT override for the dispatcher job, e.g. \"node\". Required if deploy-dispatcher-job is true."
+        required: false
+        type: string
+        default: ""
+      dispatcher-job-args:
+        description: "Comma-separated container CMD args for the dispatcher job, e.g. \"dist/run-runbook-dispatcher.js\". Required if deploy-dispatcher-job is true."
+        required: false
+        type: string
+        default: ""
+      dispatcher-job-runtime-service-account:
+        description: "Email of the identity to grant roles/run.invoker (NOT jobsExecutorWithOverrides — this job is always invoked with no per-call overrides, see the deploy step's own comment) on this job — typically a DEDICATED scheduler-invoker SA (not the web service's own runtime SA), since a dispatcher job is normally triggered by Cloud Scheduler, not an API route. Required if deploy-dispatcher-job is true."
+        required: false
+        type: string
+        default: ""
+      dispatcher-job-set-secrets:
+        description: "Comma-separated SECRET_ENV_NAME=gcp-secret-name:version pairs for the dispatcher job's OWN container — same format as scan-job-set-secrets, its own separate Cloud Run resource with its own env config."
+        required: false
+        type: string
+        default: ""
+      dispatcher-job-set-env-vars:
+        description: "Comma-separated plain KEY=value pairs (not secrets) for the dispatcher job's own container."
+        required: false
+        type: string
+        default: ""
     secrets:
       SUPABASE_ACCESS_TOKEN:
         description: "Supabase Management API token. Required if run-migrations is true."
@@ -275,6 +310,18 @@ jobs:
     runs-on: ubuntu-latest
     # See the comment on pre-deploy's environment: above.
     environment: ${{ inputs.environment }}
+    # deploy_scan_job/deploy_dispatcher_job both run with
+    # continue-on-error: true, so a failure in either does NOT fail this
+    # job — that's deliberate, so smoke-and-rollback (needs: this job)
+    # still runs and can protect an already-successfully-deployed web
+    # service even if a sibling job-worker's deploy step failed. Their
+    # outcomes are surfaced here as outputs instead, checked by
+    # verify-job-deploys at the very end of the workflow, so the overall
+    # workflow still fails visibly — just not until after smoke-and-
+    # rollback has had its chance to run.
+    outputs:
+      scan-job-deploy-outcome: ${{ steps.deploy_scan_job.outcome }}
+      dispatcher-job-deploy-outcome: ${{ steps.deploy_dispatcher_job.outcome }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
@@ -437,7 +484,9 @@ jobs:
             --region="$REGION" --member=allUsers --role=roles/run.invoker --quiet
 
       - name: Deploy scan job
+        id: deploy_scan_job
         if: inputs.deploy-scan-job == true
+        continue-on-error: true
         env:
           IMAGE: "${{ inputs.gcp-region }}-docker.pkg.dev/${{ inputs.gcp-project-id }}/${{ inputs.gcp-artifact-repo }}/${{ inputs.service }}:${{ github.sha }}"
           JOB_NAME: ${{ inputs.scan-job-name }}
@@ -447,11 +496,37 @@ jobs:
           RUNTIME_SA: ${{ inputs.scan-job-runtime-service-account }}
           JOB_SECRETS: ${{ inputs.scan-job-set-secrets }}
           JOB_ENV_VARS: ${{ inputs.scan-job-set-env-vars }}
+          OTHER_JOB_NAME: ${{ inputs.dispatcher-job-name }}
+          OTHER_JOB_ENABLED: ${{ inputs.deploy-dispatcher-job }}
         run: |
           set -euo pipefail
           # This is a SEPARATE Cloud Run resource from the web service —
           # its own env/secrets config, not inherited from set_secrets/
           # extra-env-vars above.
+          # A caller enabling deploy-scan-job but leaving command/args or
+          # the runtime SA at their empty-string default would otherwise
+          # either silently deploy the web service's OWN entrypoint onto
+          # this job (gcloud treats an empty --command/--args as "reset to
+          # the image default", not an error) or update the job's image
+          # successfully and only THEN fail on an invalid empty IAM
+          # member — leaving the job's PREVIOUS invoker binding (if any)
+          # able to trigger the newly-updated, possibly-misconfigured
+          # image even though the workflow reports failure overall. Fail
+          # before touching the job either way.
+          if [ -z "$COMMAND" ] || [ -z "$JOB_ARGS" ] || [ -z "$RUNTIME_SA" ]; then
+            echo "::error::deploy-scan-job is true but scan-job-command, scan-job-args, or scan-job-runtime-service-account is empty."
+            exit 1
+          fi
+          # A caller who accidentally points both job features at the same
+          # name would otherwise have this step's deploy silently
+          # overwritten by the dispatcher step below (or vice versa,
+          # depending on which runs later) — same resource, wrong
+          # command/args, with the OTHER step's stale IAM binding still
+          # attached. Reject the collision before either deploy runs.
+          if [ "$OTHER_JOB_ENABLED" = "true" ] && [ "$JOB_NAME" = "$OTHER_JOB_NAME" ]; then
+            echo "::error::scan-job-name and dispatcher-job-name must not be the same value ('$JOB_NAME') — they are two independent Cloud Run Jobs."
+            exit 1
+          fi
           # Explicitly clear when empty, not just omit the flag — a bare
           # omission leaves gcloud run jobs deploy's default behavior of
           # preserving whatever was set on a PRIOR deploy in place, so a
@@ -490,6 +565,73 @@ jobs:
             --region="$REGION" \
             --member="serviceAccount:${RUNTIME_SA}" \
             --role=roles/run.jobsExecutorWithOverrides \
+            --quiet
+
+      - name: Deploy dispatcher job
+        id: deploy_dispatcher_job
+        if: inputs.deploy-dispatcher-job == true
+        continue-on-error: true
+        env:
+          IMAGE: "${{ inputs.gcp-region }}-docker.pkg.dev/${{ inputs.gcp-project-id }}/${{ inputs.gcp-artifact-repo }}/${{ inputs.service }}:${{ github.sha }}"
+          JOB_NAME: ${{ inputs.dispatcher-job-name }}
+          REGION: ${{ inputs.gcp-region }}
+          COMMAND: ${{ inputs.dispatcher-job-command }}
+          JOB_ARGS: ${{ inputs.dispatcher-job-args }}
+          RUNTIME_SA: ${{ inputs.dispatcher-job-runtime-service-account }}
+          JOB_SECRETS: ${{ inputs.dispatcher-job-set-secrets }}
+          JOB_ENV_VARS: ${{ inputs.dispatcher-job-set-env-vars }}
+          OTHER_JOB_NAME: ${{ inputs.scan-job-name }}
+          OTHER_JOB_ENABLED: ${{ inputs.deploy-scan-job }}
+        run: |
+          set -euo pipefail
+          # Identical shape to "Deploy scan job" above (same image, same
+          # create-or-update semantics, same explicit-clear-when-empty
+          # reasoning, same validation rationale — see that step's own
+          # comments) — a genuinely separate Cloud Run resource, not a
+          # variant of the scan job, so it gets its own named input block
+          # rather than being folded into deploy-scan-job's.
+          if [ -z "$COMMAND" ] || [ -z "$JOB_ARGS" ] || [ -z "$RUNTIME_SA" ]; then
+            echo "::error::deploy-dispatcher-job is true but dispatcher-job-command, dispatcher-job-args, or dispatcher-job-runtime-service-account is empty."
+            exit 1
+          fi
+          if [ "$OTHER_JOB_ENABLED" = "true" ] && [ "$JOB_NAME" = "$OTHER_JOB_NAME" ]; then
+            echo "::error::scan-job-name and dispatcher-job-name must not be the same value ('$JOB_NAME') — they are two independent Cloud Run Jobs."
+            exit 1
+          fi
+          EXTRA_FLAGS=()
+          if [ -n "$JOB_SECRETS" ]; then
+            EXTRA_FLAGS+=(--set-secrets="$JOB_SECRETS")
+          else
+            EXTRA_FLAGS+=(--clear-secrets)
+          fi
+          if [ -n "$JOB_ENV_VARS" ]; then
+            EXTRA_FLAGS+=(--set-env-vars="$JOB_ENV_VARS")
+          else
+            EXTRA_FLAGS+=(--clear-env-vars)
+          fi
+          gcloud run jobs deploy "$JOB_NAME" \
+            --image="$IMAGE" \
+            --region="$REGION" \
+            --command="$COMMAND" \
+            --args="$JOB_ARGS" \
+            --max-retries=1 \
+            --task-timeout=600s \
+            "${EXTRA_FLAGS[@]}" \
+            --quiet
+          # Grants whatever identity actually triggers this job (typically
+          # a dedicated Cloud Scheduler invoker SA, not the web service's
+          # own runtime SA — see this input's own description) permission
+          # to call jobs.run — deliberately the NON-override invoker role,
+          # unlike the scan job's grant above: this job is always invoked
+          # with no per-call overrides (a scheduler firing it on a fixed
+          # interval with an empty body), so the caller genuinely never
+          # needs jobsExecutorWithOverrides' ability to change the job's
+          # execution parameters per call, and granting it anyway would be
+          # more authority than a scheduler-only invoker needs.
+          gcloud run jobs add-iam-policy-binding "$JOB_NAME" \
+            --region="$REGION" \
+            --member="serviceAccount:${RUNTIME_SA}" \
+            --role=roles/run.invoker \
             --quiet
 
       - name: Send deploy event to Datadog
@@ -765,3 +907,39 @@ jobs:
           name: smoke-evidence-${{ inputs.environment }}-${{ github.run_id }}
           path: /tmp/smoke-evidence.json
           retention-days: 30
+
+  # deploy_scan_job/deploy_dispatcher_job (build-and-deploy) run with
+  # continue-on-error: true specifically so a failure there doesn't skip
+  # smoke-and-rollback — which protects the WEB SERVICE, a higher-priority
+  # concern than either job-worker deploy succeeding. This job runs last,
+  # regardless of whether smoke-and-rollback itself ran/passed/failed
+  # (if: always()), and is what still makes a job-worker deploy failure
+  # fail the overall workflow visibly, just not until after
+  # smoke-and-rollback has had its chance to run.
+  verify-job-deploys:
+    name: Verify job-worker deploys
+    needs: [build-and-deploy, smoke-and-rollback]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Fail if a job-worker deploy failed
+        env:
+          SCAN_JOB_OUTCOME: ${{ needs.build-and-deploy.outputs.scan-job-deploy-outcome }}
+          DISPATCHER_JOB_OUTCOME: ${{ needs.build-and-deploy.outputs.dispatcher-job-deploy-outcome }}
+        run: |
+          set -euo pipefail
+          # outcome is empty/'skipped' for a caller that never enabled
+          # deploy-scan-job/deploy-dispatcher-job in the first place —
+          # only 'failure' is an actual problem.
+          FAILED=0
+          if [ "$SCAN_JOB_OUTCOME" = "failure" ]; then
+            echo "::error::Deploy scan job failed — see the build-and-deploy job's own logs above."
+            FAILED=1
+          fi
+          if [ "$DISPATCHER_JOB_OUTCOME" = "failure" ]; then
+            echo "::error::Deploy dispatcher job failed — see the build-and-deploy job's own logs above."
+            FAILED=1
+          fi
+          if [ "$FAILED" = "1" ]; then
+            exit 1
+          fi
