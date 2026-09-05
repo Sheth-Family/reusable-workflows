@@ -192,7 +192,7 @@ on:
         type: string
         default: ""
       dispatcher-job-runtime-service-account:
-        description: "Email of the identity to grant roles/run.jobsExecutorWithOverrides on this job — typically a DEDICATED scheduler-invoker SA (not the web service's own runtime SA), since a dispatcher job is normally triggered by Cloud Scheduler, not an API route. Required if deploy-dispatcher-job is true."
+        description: "Email of the identity to grant roles/run.invoker (NOT jobsExecutorWithOverrides — this job is always invoked with no per-call overrides, see the deploy step's own comment) on this job — typically a DEDICATED scheduler-invoker SA (not the web service's own runtime SA), since a dispatcher job is normally triggered by Cloud Scheduler, not an API route. Required if deploy-dispatcher-job is true."
         required: false
         type: string
         default: ""
