@@ -580,7 +580,7 @@ jobs:
           IMAGE: "${{ inputs.gcp-region }}-docker.pkg.dev/${{ inputs.gcp-project-id }}/${{ inputs.gcp-artifact-repo }}/${{ inputs.service }}:${{ github.sha }}"
           JOB_NAME: ${{ inputs.dispatcher-job-name }}
           REGION: ${{ inputs.gcp-region }}
-          PROJECT_ID: ${{ inputs.gcp-project-id }}
+          WIF_PROVIDER: ${{ inputs.gcp-wif-provider }}
           COMMAND: ${{ inputs.dispatcher-job-command }}
           JOB_ARGS: ${{ inputs.dispatcher-job-args }}
           RUNTIME_SA: ${{ inputs.dispatcher-job-runtime-service-account }}
@@ -633,7 +633,26 @@ jobs:
           if [ -n "$EXEC_SA" ]; then
             EXTRA_FLAGS+=(--service-account="$EXEC_SA")
           else
-            PROJECT_NUMBER=$(gcloud projects describe "$PROJECT_ID" --format='value(projectNumber)')
+            # Extracted from the WIF provider's OWN resource name
+            # (projects/{NUMBER}/locations/.../providers/...) rather than
+            # a `gcloud projects describe` call — that call needs
+            # resourcemanager.projects.get, a permission a least-
+            # privileged deployer with only Cloud Run and
+            # iam.serviceAccounts.actAs grants may lack; since this whole
+            # step is continue-on-error, a deployer missing that one
+            # extra permission would silently leave a stale dispatcher
+            # deployed while the workflow still reports success
+            # (Codex-caught, PR #10 round 2). A WIF provider's full
+            # resource name is ALWAYS projects/{PROJECT_NUMBER}/... (the
+            # numeric project number, never the string project id) — a
+            # hard constraint of the resource name format itself, not a
+            # convention that could vary by provider.
+            PROJECT_NUMBER="${WIF_PROVIDER#projects/}"
+            PROJECT_NUMBER="${PROJECT_NUMBER%%/*}"
+            if ! [[ "$PROJECT_NUMBER" =~ ^[0-9]+$ ]]; then
+              echo "::error::Could not extract a numeric project number from gcp-wif-provider ('$WIF_PROVIDER') to resolve the default compute service account. Expected format: projects/{NUMBER}/locations/.../providers/...."
+              exit 1
+            fi
             EXTRA_FLAGS+=(--service-account="${PROJECT_NUMBER}-compute@developer.gserviceaccount.com")
           fi
           gcloud run jobs deploy "$JOB_NAME" \
