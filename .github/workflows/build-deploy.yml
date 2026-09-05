@@ -196,6 +196,11 @@ on:
         required: false
         type: string
         default: ""
+      dispatcher-job-execution-service-account:
+        description: "Email of the service account the job's OWN CONTAINER runs as when executing (passed as gcloud run jobs deploy --service-account) — a completely different concern from dispatcher-job-runtime-service-account above, which only grants some OTHER identity permission to invoke this job. Neither the scan job's nor this job's deploy step has ever set --service-account before this input existed, so both were silently running as the project's bare default compute service account — harmless for a scan job that only needs data-plane secrets (Supabase/GitHub), but insufficient for a dispatcher whose own code calls the Cloud Run Admin API (e.g. to trigger a scan job execution), since that call is authenticated as whatever identity the CALLING job's container itself runs as, via the metadata server. Optional and empty by default, preserving the pre-existing (undocumented) default-compute-SA behavior for any consumer that doesn't need this; a dispatcher that calls back into another Cloud Run Job should set this to an identity already granted the appropriate role on that target job (e.g. the same SA passed as scan-job-runtime-service-account, so the dispatcher can trigger the scan job with the identical grant the web service already relies on)."
+        required: false
+        type: string
+        default: ""
       dispatcher-job-set-secrets:
         description: "Comma-separated SECRET_ENV_NAME=gcp-secret-name:version pairs for the dispatcher job's OWN container — same format as scan-job-set-secrets, its own separate Cloud Run resource with its own env config."
         required: false
@@ -578,6 +583,7 @@ jobs:
           COMMAND: ${{ inputs.dispatcher-job-command }}
           JOB_ARGS: ${{ inputs.dispatcher-job-args }}
           RUNTIME_SA: ${{ inputs.dispatcher-job-runtime-service-account }}
+          EXEC_SA: ${{ inputs.dispatcher-job-execution-service-account }}
           JOB_SECRETS: ${{ inputs.dispatcher-job-set-secrets }}
           JOB_ENV_VARS: ${{ inputs.dispatcher-job-set-env-vars }}
           OTHER_JOB_NAME: ${{ inputs.scan-job-name }}
@@ -608,6 +614,16 @@ jobs:
             EXTRA_FLAGS+=(--set-env-vars="$JOB_ENV_VARS")
           else
             EXTRA_FLAGS+=(--clear-env-vars)
+          fi
+          # Only pass --service-account when explicitly given — an empty
+          # value here must NOT translate into an explicit
+          # --service-account="" (gcloud would reject that outright);
+          # omitting the flag entirely preserves gcloud's own default
+          # behavior (project default compute SA on first creation,
+          # whatever was already set on a later update), matching every
+          # other optional flag in this step's own EXTRA_FLAGS pattern.
+          if [ -n "$EXEC_SA" ]; then
+            EXTRA_FLAGS+=(--service-account="$EXEC_SA")
           fi
           gcloud run jobs deploy "$JOB_NAME" \
             --image="$IMAGE" \
