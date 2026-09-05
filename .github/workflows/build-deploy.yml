@@ -310,6 +310,18 @@ jobs:
     runs-on: ubuntu-latest
     # See the comment on pre-deploy's environment: above.
     environment: ${{ inputs.environment }}
+    # deploy_scan_job/deploy_dispatcher_job both run with
+    # continue-on-error: true, so a failure in either does NOT fail this
+    # job — that's deliberate, so smoke-and-rollback (needs: this job)
+    # still runs and can protect an already-successfully-deployed web
+    # service even if a sibling job-worker's deploy step failed. Their
+    # outcomes are surfaced here as outputs instead, checked by
+    # verify-job-deploys at the very end of the workflow, so the overall
+    # workflow still fails visibly — just not until after smoke-and-
+    # rollback has had its chance to run.
+    outputs:
+      scan-job-deploy-outcome: ${{ steps.deploy_scan_job.outcome }}
+      dispatcher-job-deploy-outcome: ${{ steps.deploy_dispatcher_job.outcome }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
@@ -472,7 +484,9 @@ jobs:
             --region="$REGION" --member=allUsers --role=roles/run.invoker --quiet
 
       - name: Deploy scan job
+        id: deploy_scan_job
         if: inputs.deploy-scan-job == true
+        continue-on-error: true
         env:
           IMAGE: "${{ inputs.gcp-region }}-docker.pkg.dev/${{ inputs.gcp-project-id }}/${{ inputs.gcp-artifact-repo }}/${{ inputs.service }}:${{ github.sha }}"
           JOB_NAME: ${{ inputs.scan-job-name }}
@@ -487,6 +501,15 @@ jobs:
           # This is a SEPARATE Cloud Run resource from the web service —
           # its own env/secrets config, not inherited from set_secrets/
           # extra-env-vars above.
+          # A caller enabling deploy-scan-job but leaving command/args at
+          # their empty-string default would otherwise silently deploy
+          # the web service's OWN entrypoint onto this job (gcloud treats
+          # an empty --command/--args as "reset to the image default",
+          # not an error) — fail loudly instead.
+          if [ -z "$COMMAND" ] || [ -z "$JOB_ARGS" ]; then
+            echo "::error::deploy-scan-job is true but scan-job-command or scan-job-args is empty."
+            exit 1
+          fi
           # Explicitly clear when empty, not just omit the flag — a bare
           # omission leaves gcloud run jobs deploy's default behavior of
           # preserving whatever was set on a PRIOR deploy in place, so a
@@ -528,7 +551,9 @@ jobs:
             --quiet
 
       - name: Deploy dispatcher job
+        id: deploy_dispatcher_job
         if: inputs.deploy-dispatcher-job == true
+        continue-on-error: true
         env:
           IMAGE: "${{ inputs.gcp-region }}-docker.pkg.dev/${{ inputs.gcp-project-id }}/${{ inputs.gcp-artifact-repo }}/${{ inputs.service }}:${{ github.sha }}"
           JOB_NAME: ${{ inputs.dispatcher-job-name }}
@@ -545,6 +570,10 @@ jobs:
           # reasoning) — a genuinely separate Cloud Run resource, not a
           # variant of the scan job, so it gets its own named input block
           # rather than being folded into deploy-scan-job's.
+          if [ -z "$COMMAND" ] || [ -z "$JOB_ARGS" ]; then
+            echo "::error::deploy-dispatcher-job is true but dispatcher-job-command or dispatcher-job-args is empty."
+            exit 1
+          fi
           EXTRA_FLAGS=()
           if [ -n "$JOB_SECRETS" ]; then
             EXTRA_FLAGS+=(--set-secrets="$JOB_SECRETS")
@@ -568,11 +597,17 @@ jobs:
           # Grants whatever identity actually triggers this job (typically
           # a dedicated Cloud Scheduler invoker SA, not the web service's
           # own runtime SA — see this input's own description) permission
-          # to call jobs.run, nothing broader.
+          # to call jobs.run — deliberately the NON-override invoker role,
+          # unlike the scan job's grant above: this job is always invoked
+          # with no per-call overrides (a scheduler firing it on a fixed
+          # interval with an empty body), so the caller genuinely never
+          # needs jobsExecutorWithOverrides' ability to change the job's
+          # execution parameters per call, and granting it anyway would be
+          # more authority than a scheduler-only invoker needs.
           gcloud run jobs add-iam-policy-binding "$JOB_NAME" \
             --region="$REGION" \
             --member="serviceAccount:${RUNTIME_SA}" \
-            --role=roles/run.jobsExecutorWithOverrides \
+            --role=roles/run.invoker \
             --quiet
 
       - name: Send deploy event to Datadog
@@ -848,3 +883,39 @@ jobs:
           name: smoke-evidence-${{ inputs.environment }}-${{ github.run_id }}
           path: /tmp/smoke-evidence.json
           retention-days: 30
+
+  # deploy_scan_job/deploy_dispatcher_job (build-and-deploy) run with
+  # continue-on-error: true specifically so a failure there doesn't skip
+  # smoke-and-rollback — which protects the WEB SERVICE, a higher-priority
+  # concern than either job-worker deploy succeeding. This job runs last,
+  # regardless of whether smoke-and-rollback itself ran/passed/failed
+  # (if: always()), and is what still makes a job-worker deploy failure
+  # fail the overall workflow visibly, just not until after
+  # smoke-and-rollback has had its chance to run.
+  verify-job-deploys:
+    name: Verify job-worker deploys
+    needs: [build-and-deploy, smoke-and-rollback]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Fail if a job-worker deploy failed
+        env:
+          SCAN_JOB_OUTCOME: ${{ needs.build-and-deploy.outputs.scan-job-deploy-outcome }}
+          DISPATCHER_JOB_OUTCOME: ${{ needs.build-and-deploy.outputs.dispatcher-job-deploy-outcome }}
+        run: |
+          set -euo pipefail
+          # outcome is empty/'skipped' for a caller that never enabled
+          # deploy-scan-job/deploy-dispatcher-job in the first place —
+          # only 'failure' is an actual problem.
+          FAILED=0
+          if [ "$SCAN_JOB_OUTCOME" = "failure" ]; then
+            echo "::error::Deploy scan job failed — see the build-and-deploy job's own logs above."
+            FAILED=1
+          fi
+          if [ "$DISPATCHER_JOB_OUTCOME" = "failure" ]; then
+            echo "::error::Deploy dispatcher job failed — see the build-and-deploy job's own logs above."
+            FAILED=1
+          fi
+          if [ "$FAILED" = "1" ]; then
+            exit 1
+          fi
