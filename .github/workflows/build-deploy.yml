@@ -458,6 +458,9 @@ jobs:
           SET_SECRETS: ${{ inputs.set_secrets }}
           EXTRA_ENV_VARS: ${{ inputs.extra-env-vars }}
           PUBLIC_VIA_LB: ${{ inputs.public-via-load-balancer }}
+          # Unique per run attempt, so this run knows its own revision name
+          # without a post-deploy lookup (which can race an overlapping run).
+          REVISION_SUFFIX: r${{ github.run_id }}-${{ github.run_attempt }}
         run: |
           set -euo pipefail
           ENV_VARS="NEXT_PUBLIC_ENV=${NEXT_PUBLIC_ENV},DD_ENV=${DD_ENV}"
@@ -482,15 +485,16 @@ jobs:
             --set-env-vars="$ENV_VARS" \
             --set-secrets="$SET_SECRETS" \
             "${INGRESS_FLAG[@]}" \
+            --revision-suffix="$REVISION_SUFFIX" \
             --quiet
+          DEPLOYED="${SERVICE}-${REVISION_SUFFIX}"
           # gcloud run deploy only shifts traffic when the service routes to
           # LATEST. A rollback (smoke-and-rollback below) pins traffic to a
           # specific revision, and that pin survives every later deploy: the
           # new revision goes Ready and serves 0% while smoke keeps passing
-          # against the pinned one. Route to the new revision explicitly.
-          DEPLOYED=$(gcloud run services describe "$SERVICE" \
-            --region="$REGION" \
-            --format='value(status.latestCreatedRevisionName)')
+          # against the pinned one. Route to latest explicitly — if an
+          # overlapping run deployed after us, latest is theirs, and
+          # smoke-and-rollback's traffic check reports this run superseded.
           gcloud run services update-traffic "$SERVICE" \
             --to-latest \
             --region="$REGION" \
