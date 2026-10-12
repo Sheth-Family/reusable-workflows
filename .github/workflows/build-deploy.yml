@@ -237,9 +237,12 @@ permissions:
 # One deploy per service at a time, end to end. Overlapping runs otherwise
 # race on the service's traffic split: a later run can be rolled back by an
 # earlier run's smoke failure, since update-traffic has no compare-and-set.
-# Queues rather than cancels (a cancelled deploy can strand traffic
-# mid-shift). The build-deploy- prefix keeps this distinct from any group a
-# caller defines for its own workflow, so the two can never deadlock.
+# Never cancels an in-progress deploy (that can strand traffic mid-shift);
+# of the runs waiting behind it, the newest pending one wins — it already
+# contains the older commits, so deploying those in between would only
+# briefly serve older code. The build-deploy- prefix keeps this distinct
+# from any group a caller defines for its own workflow, so the two can
+# never deadlock.
 concurrency:
   group: build-deploy-${{ inputs.gcp-project-id }}-${{ inputs.service }}
   cancel-in-progress: false
@@ -507,6 +510,10 @@ jobs:
             --revision-suffix="$REVISION_SUFFIX" \
             --quiet
           DEPLOYED="${SERVICE}-${REVISION_SUFFIX}"
+          # Published before the traffic update below: on a LATEST-routed
+          # service the revision may already be live, so smoke-and-rollback
+          # must still run even if that update fails.
+          echo "revision=${DEPLOYED}" >> "$GITHUB_OUTPUT"
           # gcloud run deploy only shifts traffic when the service routes to
           # LATEST. A rollback (smoke-and-rollback below) pins traffic to a
           # specific revision, and that pin survives every later deploy: the
@@ -518,7 +525,6 @@ jobs:
             --to-latest \
             --region="$REGION" \
             --quiet
-          echo "revision=${DEPLOYED}" >> "$GITHUB_OUTPUT"
           echo "Deployed revision: ${DEPLOYED} (traffic → latest)"
 
       - name: Configure public access via Load Balancer
@@ -983,6 +989,7 @@ jobs:
             exit 0
           fi
           echo "⏪ Rolling back ${SERVICE} to ${PRIOR} ..."
+          echo "attempted=true" >> "$GITHUB_OUTPUT"
           gcloud run services update-traffic "$SERVICE" \
             --to-revisions="${PRIOR}=100" \
             --region="$REGION" \
@@ -1052,6 +1059,7 @@ jobs:
           SHA: ${{ github.sha }}
           SMOKE_RESULT: ${{ steps.smoke.outcome }}
           SUPERSEDED: ${{ steps.traffic.outputs.superseded }}
+          ROLLBACK_ATTEMPTED: ${{ steps.rollback.outputs.attempted }}
           ROLLED_BACK: ${{ steps.rollback.outputs.rolled_back }}
           PRIOR: ${{ needs.pre-deploy.outputs.prior_revision }}
           RUN_ID: ${{ github.run_id }}
@@ -1059,10 +1067,15 @@ jobs:
         run: |
           # From the rollback step itself: smoke can be skipped without a
           # rollback (superseded run), a rollback can follow a failed traffic
-          # check before smoke ever ran, and the rollback can decline to act.
+          # check before smoke ever ran, the rollback can decline to act, and
+          # an attempted rollback can itself fail — reported separately.
           ROLLBACK_TRIGGERED="false"
-          if [ "$ROLLED_BACK" = "true" ]; then
+          ROLLBACK_COMPLETED="false"
+          if [ "$ROLLBACK_ATTEMPTED" = "true" ]; then
             ROLLBACK_TRIGGERED="true"
+          fi
+          if [ "$ROLLED_BACK" = "true" ]; then
+            ROLLBACK_COMPLETED="true"
           fi
           if [ "$SUPERSEDED" = "true" ]; then
             SMOKE_RESULT="superseded"
@@ -1075,11 +1088,13 @@ jobs:
             --arg result "$SMOKE_RESULT" \
             --arg prior_revision "$PRIOR" \
             --arg rollback_triggered "$ROLLBACK_TRIGGERED" \
+            --arg rollback_completed "$ROLLBACK_COMPLETED" \
             --arg run_id "$RUN_ID" \
             --arg run_url "$RUN_URL" \
             '{event: $event, service: $service, environment: $environment, sha: $sha,
               result: $result, prior_revision: $prior_revision,
-              rollback_triggered: $rollback_triggered, run_id: $run_id, run_url: $run_url}' \
+              rollback_triggered: $rollback_triggered, rollback_completed: $rollback_completed,
+              run_id: $run_id, run_url: $run_url}' \
             > /tmp/smoke-evidence.json
           echo "Evidence:"
           cat /tmp/smoke-evidence.json
