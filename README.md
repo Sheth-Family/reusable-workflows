@@ -90,7 +90,15 @@ constraint, not a general pattern.
 
 - `ci-checks.yml` — typecheck, lint, `npm audit --audit-level=high`. Takes a
   `node-version` input (default `22`) — pins Node explicitly rather than
-  relying on whatever the runner image happens to preinstall.
+  relying on whatever the runner image happens to preinstall. Also takes
+  `audit-allowlist` (default `""`, opt-in): a comma-separated list of GHSA
+  ids to tolerate in the audit gate, for the case where `npm audit` starts
+  failing a previously-clean lockfile because a new advisory published
+  against an existing dependency has no available fix (see the workflow's
+  own header comment for the full reasoning and a real worked example).
+  Every advisory not explicitly listed still fails the build exactly as
+  before — this never relaxes the gate for anything else, and the step logs
+  which allowlisted advisories it actually used on each run.
 - `ci-lint-workflows.yml` — actionlint + shellcheck on the calling repo's
   own workflow files.
 - `secret-scan.yml` — gitleaks, pinned binary install (not the marketplace

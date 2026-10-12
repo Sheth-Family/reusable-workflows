@@ -7,6 +7,29 @@ name: CI — Type check, Lint, Audit (reusable)
 #
 # No continue-on-error — all three must pass to merge.
 #
+# audit-allowlist (opt-in, empty by default — see that input's own
+# description): npm audit checks live against the registry every run, so a
+# previously-clean lockfile can start failing with zero code changes the
+# moment a new advisory is published — independent of whether that advisory
+# has a fix, or is even a real vulnerability. Confirmed directly on
+# wearesentinull/sentinull (2026-10): GHSA-vfj7-8cjw-p6xm (`braces`,
+# transitive via eslint-config-next's own @next/eslint-plugin-next ->
+# fast-glob -> micromatch chain) has no patched version at any release
+# (upstream advisory data: patched_versions: null, vulnerable range <=
+# 3.0.3, which is also npm's current "latest") — and is under active
+# dispute by the braces maintainer and multiple security researchers
+# (github/advisory-database#10132; micromatch/braces#73, #84), who argue
+# the underlying behavior (a catchable RangeError on pathologically nested
+# input) isn't a real vulnerability at all. Without this input, a venture
+# hitting a case like that has no way to get a genuinely green quality gate
+# until the advisory itself resolves one way or the other — which may never
+# happen if the maintainer's "nothing to fix" position holds. This does NOT
+# relax the gate for anything else: every advisory not explicitly listed
+# still fails the build exactly as before, and the step logs every
+# allowlisted advisory it actually used on each run, so a stale entry
+# (a since-published fix, an advisory that gets formally withdrawn) stays
+# visible rather than silently inert.
+#
 # Pins an explicit Node version rather than relying on whatever the runner
 # image happens to preinstall — that drifted silently in the original
 # non-reusable version of this workflow (template-fullstack-app history).
@@ -34,6 +57,19 @@ on:
         required: false
         type: string
         default: "22"
+      audit-allowlist:
+        description: >-
+          Comma-separated GHSA ids (e.g. "GHSA-xxxx-xxxx-xxxx,GHSA-yyyy-yyyy-yyyy")
+          to tolerate as already-reviewed exceptions in the high/critical audit
+          gate. Empty by default — every venture must opt in explicitly, and
+          every entry here should have its own justification comment in the
+          calling venture's own ci-checks.yml wrapper (not just this input's
+          value), reviewed periodically rather than left to accumulate. See
+          this workflow's own header comment for the reasoning and a worked
+          example.
+        required: false
+        type: string
+        default: ""
 
 permissions:
   contents: read
@@ -80,4 +116,46 @@ jobs:
         run: npm run lint
 
       - name: Dependency audit (high and critical)
-        run: npm audit --audit-level=high
+        env:
+          AUDIT_ALLOWLIST: ${{ inputs.audit-allowlist }}
+        run: |
+          REPORT=$(npm audit --audit-level=high --json || true)
+          HIGH_OR_CRITICAL=$(echo "$REPORT" | jq -r '.metadata.vulnerabilities.high + .metadata.vulnerabilities.critical')
+
+          if [ "$HIGH_OR_CRITICAL" = "0" ]; then
+            echo "No high/critical vulnerabilities found."
+            exit 0
+          fi
+
+          # Every distinct GHSA advisory id present anywhere in the report
+          # at high/critical severity — recursive descent rather than just
+          # the top-level entries, since a transitive package's own entry
+          # only references its root cause by name (`via: ["fast-glob"]`),
+          # not the advisory object itself; the advisory's `url` field
+          # always appears on whichever package is the actual root cause.
+          FOUND=$(echo "$REPORT" | jq -r '
+            [.. | objects | select(.severity == "high" or .severity == "critical") | .url? // empty]
+            | map(select(startswith("https://github.com/advisories/")))
+            | map(ltrimstr("https://github.com/advisories/"))
+            | unique | .[]
+          ')
+          ALLOWED=$(echo "$AUDIT_ALLOWLIST" | tr ',' '\n' | sed 's/^ *//;s/ *$//' | sed '/^$/d')
+          UNALLOWED=$(comm -23 <(echo "$FOUND" | sort) <(echo "$ALLOWED" | sort))
+
+          if [ -n "$ALLOWED" ]; then
+            ALLOWLISTED_PRESENT=$(comm -12 <(echo "$FOUND" | sort) <(echo "$ALLOWED" | sort))
+            if [ -n "$ALLOWLISTED_PRESENT" ]; then
+              echo "::notice::Allowlisted advisories present in this report (reviewed, justification in this venture's own ci-checks.yml wrapper):"
+              echo "$ALLOWLISTED_PRESENT" | awk '{print "  - " $0}'
+            fi
+          fi
+
+          if [ -n "$UNALLOWED" ]; then
+            echo "::error::High/critical vulnerabilities found that are NOT on audit-allowlist:"
+            echo "$UNALLOWED" | awk '{print "  - " $0}'
+            echo ""
+            npm audit --audit-level=high || true
+            exit 1
+          fi
+
+          echo "All high/critical findings are covered by audit-allowlist. Passing."
