@@ -858,19 +858,36 @@ jobs:
             echo "::error::build-and-deploy did not report a deployed revision — cannot verify what is serving."
             exit 1
           fi
-          SERVING=$(gcloud run services describe "$SERVICE" \
+          SVC_JSON=$(gcloud run services describe "$SERVICE" \
             --region="$REGION" \
             --project="$PROJECT_ID" \
-            --format=json \
-            | jq -r --arg rev "$DEPLOYED" '[.status.traffic[]? | select(.revisionName == $rev) | (.percent // 0)] | add // 0')
+            --format=json)
+          SERVING=$(jq -r --arg rev "$DEPLOYED" '[.status.traffic[]? | select(.revisionName == $rev) | (.percent // 0)] | add // 0' <<<"$SVC_JSON")
           echo "Deployed revision ${DEPLOYED} is serving ${SERVING}% of traffic"
-          if [ "$SERVING" != "100" ]; then
-            echo "::error::${DEPLOYED} is serving ${SERVING}%, not 100% — traffic is routed elsewhere (pinned?)."
-            exit 1
+          if [ "$SERVING" = "100" ]; then
+            exit 0
           fi
+          # Not serving. If the revision that IS serving was created after
+          # ours, an overlapping run for this service has already deployed
+          # past us: skip smoke and rollback rather than roll its newer
+          # deploy back. Anything older (a pin, a failed shift) is ours to fail.
+          TOP=$(jq -r '[.status.traffic[]? | select((.percent // 0) > 0 and .revisionName)] | max_by(.percent) | .revisionName // empty' <<<"$SVC_JSON")
+          created() {
+            gcloud run revisions describe "$1" --region="$REGION" --project="$PROJECT_ID" \
+              --format='value(metadata.creationTimestamp)' 2>/dev/null || true
+          }
+          OURS_AT=$(created "$DEPLOYED"); TOP_AT=${TOP:+$(created "$TOP")}
+          if [ -n "$OURS_AT" ] && [ -n "$TOP_AT" ] && [[ "$TOP_AT" > "$OURS_AT" ]]; then
+            echo "::warning::${DEPLOYED} was superseded by newer revision ${TOP} (created ${TOP_AT}) from an overlapping deploy — skipping smoke and rollback."
+            echo "superseded=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "::error::${DEPLOYED} is serving ${SERVING}%, not 100% — traffic is routed to ${TOP:-<unknown>} instead (pinned?)."
+          exit 1
 
       - name: Post-deploy smoke test
         id: smoke
+        if: steps.traffic.outputs.superseded != 'true'
         env:
           HEALTH_URL: ${{ inputs.health-check-url }}
         run: |
@@ -908,6 +925,7 @@ jobs:
           fi
 
       - name: Rollback to prior revision
+        id: rollback
         if: failure()
         env:
           SERVICE: ${{ inputs.service }}
@@ -988,13 +1006,21 @@ jobs:
           ENVIRONMENT: ${{ inputs.environment }}
           SHA: ${{ github.sha }}
           SMOKE_RESULT: ${{ steps.smoke.outcome }}
+          SUPERSEDED: ${{ steps.traffic.outputs.superseded }}
+          ROLLBACK_OUTCOME: ${{ steps.rollback.outcome }}
           PRIOR: ${{ needs.pre-deploy.outputs.prior_revision }}
           RUN_ID: ${{ github.run_id }}
           RUN_URL: "https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
         run: |
+          # From the rollback step's own outcome: smoke can now be skipped
+          # without a rollback (superseded run) or a rollback can follow a
+          # failed traffic check before smoke ever ran.
           ROLLBACK_TRIGGERED="false"
-          if [ "$SMOKE_RESULT" != "success" ] && [ -n "$PRIOR" ]; then
+          if [ "$ROLLBACK_OUTCOME" = "success" ] && [ -n "$PRIOR" ]; then
             ROLLBACK_TRIGGERED="true"
+          fi
+          if [ "$SUPERSEDED" = "true" ]; then
+            SMOKE_RESULT="superseded"
           fi
           jq -n \
             --arg event "post_deploy_smoke" \
