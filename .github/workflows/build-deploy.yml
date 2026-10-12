@@ -234,7 +234,7 @@ permissions:
   contents: read
   id-token: write
 
-# One deploy per service at a time, end to end. Overlapping runs otherwise
+# One deploy per Cloud Run service (project + region + name) at a time. Overlapping runs otherwise
 # race on the service's traffic split: a later run can be rolled back by an
 # earlier run's smoke failure, since update-traffic has no compare-and-set.
 # Never cancels an in-progress deploy (that can strand traffic mid-shift);
@@ -244,7 +244,7 @@ permissions:
 # from any group a caller defines for its own workflow, so the two can
 # never deadlock.
 concurrency:
-  group: build-deploy-${{ inputs.gcp-project-id }}-${{ inputs.service }}
+  group: build-deploy-${{ inputs.gcp-project-id }}-${{ inputs.gcp-region }}-${{ inputs.service }}
   cancel-in-progress: false
 
 jobs:
