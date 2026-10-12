@@ -458,11 +458,20 @@ jobs:
           SET_SECRETS: ${{ inputs.set_secrets }}
           EXTRA_ENV_VARS: ${{ inputs.extra-env-vars }}
           PUBLIC_VIA_LB: ${{ inputs.public-via-load-balancer }}
-          # Unique per run attempt, so this run knows its own revision name
-          # without a post-deploy lookup (which can race an overlapping run).
-          REVISION_SUFFIX: r${{ github.run_id }}-${{ github.run_attempt }}
+          RUN_ID: ${{ github.run_id }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
         run: |
           set -euo pipefail
+          # Unique per run attempt, so this run knows its own revision name
+          # without a post-deploy lookup (which can race an overlapping run).
+          # Revision names cap at 63 chars and must start with the service
+          # name (itself up to 49); if the readable suffix doesn't fit, use a
+          # hash of the same inputs, truncated to the space left.
+          REVISION_SUFFIX="r${RUN_ID}-${RUN_ATTEMPT}"
+          ROOM=$(( 63 - ${#SERVICE} - 1 ))
+          if [ "${#REVISION_SUFFIX}" -gt "$ROOM" ]; then
+            REVISION_SUFFIX="h$(printf '%s' "${RUN_ID}-${RUN_ATTEMPT}" | sha256sum | cut -c1-$(( ROOM - 1 )))"
+          fi
           ENV_VARS="NEXT_PUBLIC_ENV=${NEXT_PUBLIC_ENV},DD_ENV=${DD_ENV}"
           if [ -n "$EXTRA_ENV_VARS" ]; then
             ENV_VARS="${ENV_VARS},${EXTRA_ENV_VARS}"
@@ -936,18 +945,33 @@ jobs:
           REGION: ${{ inputs.gcp-region }}
           PROJECT_ID: ${{ inputs.gcp-project-id }}
           PRIOR: ${{ needs.pre-deploy.outputs.prior_revision }}
+          DEPLOYED: ${{ needs.build-and-deploy.outputs.deployed-revision }}
         run: |
           set -euo pipefail
-          if [ -n "$PRIOR" ]; then
-            echo "⏪ Rolling back ${SERVICE} to ${PRIOR} ..."
-            gcloud run services update-traffic "$SERVICE" \
-              --to-revisions="${PRIOR}=100" \
-              --region="$REGION" \
-              --project="$PROJECT_ID"
-            echo "✅ Rollback complete — ${PRIOR} serving 100%"
-          else
+          if [ -z "$PRIOR" ]; then
             echo "⚠️  No prior revision recorded — skipping rollback (first deploy?)"
+            exit 0
           fi
+          # Only roll back traffic this run's revision still holds, checked
+          # immediately before changing it: an overlapping run may have routed
+          # past us during smoke, and when ours serves 0% (pinned elsewhere,
+          # superseded) there is nothing of ours to roll back.
+          OURS=$(gcloud run services describe "$SERVICE" \
+            --region="$REGION" \
+            --project="$PROJECT_ID" \
+            --format=json \
+            | jq -r --arg rev "$DEPLOYED" '[.status.traffic[]? | select(.revisionName == $rev) | (.percent // 0)] | add // 0')
+          if [ -n "$DEPLOYED" ] && [ "$OURS" = "0" ]; then
+            echo "⚠️  ${DEPLOYED} no longer serves traffic — skipping rollback to avoid overriding whatever does."
+            exit 0
+          fi
+          echo "⏪ Rolling back ${SERVICE} to ${PRIOR} ..."
+          gcloud run services update-traffic "$SERVICE" \
+            --to-revisions="${PRIOR}=100" \
+            --region="$REGION" \
+            --project="$PROJECT_ID"
+          echo "rolled_back=true" >> "$GITHUB_OUTPUT"
+          echo "✅ Rollback complete — ${PRIOR} serving 100%"
 
       - name: Verify deployed revision is serving traffic
         if: always()
@@ -1011,16 +1035,16 @@ jobs:
           SHA: ${{ github.sha }}
           SMOKE_RESULT: ${{ steps.smoke.outcome }}
           SUPERSEDED: ${{ steps.traffic.outputs.superseded }}
-          ROLLBACK_OUTCOME: ${{ steps.rollback.outcome }}
+          ROLLED_BACK: ${{ steps.rollback.outputs.rolled_back }}
           PRIOR: ${{ needs.pre-deploy.outputs.prior_revision }}
           RUN_ID: ${{ github.run_id }}
           RUN_URL: "https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
         run: |
-          # From the rollback step's own outcome: smoke can now be skipped
-          # without a rollback (superseded run) or a rollback can follow a
-          # failed traffic check before smoke ever ran.
+          # From the rollback step itself: smoke can be skipped without a
+          # rollback (superseded run), a rollback can follow a failed traffic
+          # check before smoke ever ran, and the rollback can decline to act.
           ROLLBACK_TRIGGERED="false"
-          if [ "$ROLLBACK_OUTCOME" = "success" ] && [ -n "$PRIOR" ]; then
+          if [ "$ROLLED_BACK" = "true" ]; then
             ROLLBACK_TRIGGERED="true"
           fi
           if [ "$SUPERSEDED" = "true" ]; then
