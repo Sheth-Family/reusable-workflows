@@ -234,6 +234,16 @@ permissions:
   contents: read
   id-token: write
 
+# One deploy per service at a time, end to end. Overlapping runs otherwise
+# race on the service's traffic split: a later run can be rolled back by an
+# earlier run's smoke failure, since update-traffic has no compare-and-set.
+# Queues rather than cancels (a cancelled deploy can strand traffic
+# mid-shift). The build-deploy- prefix keeps this distinct from any group a
+# caller defines for its own workflow, so the two can never deadlock.
+concurrency:
+  group: build-deploy-${{ inputs.gcp-project-id }}-${{ inputs.service }}
+  cancel-in-progress: false
+
 jobs:
   pre-deploy:
     name: Capture prior Cloud Run revision
@@ -816,7 +826,14 @@ jobs:
   smoke-and-rollback:
     name: Smoke & Rollback (${{ inputs.environment }})
     needs: [pre-deploy, build-and-deploy]
-    if: inputs.enable-smoke-and-rollback
+    # Runs whenever this run put a revision in front of traffic — including
+    # when a later build-and-deploy step (e.g. the load-balancer bindings)
+    # failed after the traffic shift, which would otherwise skip this job
+    # and leave an unsmoked revision live.
+    if: >-
+      !cancelled() && inputs.enable-smoke-and-rollback
+      && needs.pre-deploy.result == 'success'
+      && needs.build-and-deploy.outputs.deployed-revision != ''
     runs-on: ubuntu-latest
     # See the comment on pre-deploy's environment: above. This job is a
     # post-deploy safety net — accepting the (currently theoretical, for
