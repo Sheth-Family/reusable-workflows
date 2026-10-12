@@ -304,13 +304,25 @@ jobs:
           PROJECT_ID: ${{ inputs.gcp-project-id }}
         run: |
           set -uo pipefail
-          REVISION=$(gcloud run revisions list \
-            --service="$SERVICE" \
+          # The revision actually SERVING traffic, not the newest-created
+          # one — they differ whenever traffic is pinned (e.g. by an earlier
+          # rollback), and rolling back to a revision that never served is
+          # no rollback at all. Newest-created is only the fallback when
+          # nothing is serving yet.
+          REVISION=$(gcloud run services describe "$SERVICE" \
             --region="$REGION" \
             --project="$PROJECT_ID" \
-            --format='value(metadata.name)' \
-            --limit=1 \
-            --sort-by='~metadata.creationTimestamp' 2>/dev/null || echo "")
+            --format=json 2>/dev/null \
+            | jq -r '[.status.traffic[]? | select((.percent // 0) > 0 and .revisionName)] | max_by(.percent) | .revisionName // empty' 2>/dev/null || echo "")
+          if [ -z "$REVISION" ]; then
+            REVISION=$(gcloud run revisions list \
+              --service="$SERVICE" \
+              --region="$REGION" \
+              --project="$PROJECT_ID" \
+              --format='value(metadata.name)' \
+              --limit=1 \
+              --sort-by='~metadata.creationTimestamp' 2>/dev/null || echo "")
+          fi
           echo "revision=${REVISION}" >> "$GITHUB_OUTPUT"
           echo "Prior revision: ${REVISION:-<none — first deploy>}"
 
@@ -330,6 +342,7 @@ jobs:
     # workflow still fails visibly — just not until after smoke-and-
     # rollback has had its chance to run.
     outputs:
+      deployed-revision: ${{ steps.deploy_service.outputs.revision }}
       scan-job-deploy-outcome: ${{ steps.deploy_scan_job.outcome }}
       dispatcher-job-deploy-outcome: ${{ steps.deploy_dispatcher_job.outcome }}
     steps:
@@ -434,6 +447,7 @@ jobs:
           npx supabase db push --db-url "$POOLER_URL"
 
       - name: Deploy to Cloud Run
+        id: deploy_service
         env:
           IMAGE: "${{ inputs.gcp-region }}-docker.pkg.dev/${{ inputs.gcp-project-id }}/${{ inputs.gcp-artifact-repo }}/${{ inputs.service }}:${{ github.sha }}"
           SERVICE: ${{ inputs.service }}
@@ -469,6 +483,20 @@ jobs:
             --set-secrets="$SET_SECRETS" \
             "${INGRESS_FLAG[@]}" \
             --quiet
+          # gcloud run deploy only shifts traffic when the service routes to
+          # LATEST. A rollback (smoke-and-rollback below) pins traffic to a
+          # specific revision, and that pin survives every later deploy: the
+          # new revision goes Ready and serves 0% while smoke keeps passing
+          # against the pinned one. Route to the new revision explicitly.
+          DEPLOYED=$(gcloud run services describe "$SERVICE" \
+            --region="$REGION" \
+            --format='value(status.latestCreatedRevisionName)')
+          gcloud run services update-traffic "$SERVICE" \
+            --to-latest \
+            --region="$REGION" \
+            --quiet
+          echo "revision=${DEPLOYED}" >> "$GITHUB_OUTPUT"
+          echo "Deployed revision: ${DEPLOYED} (traffic → latest)"
 
       - name: Configure public access via Load Balancer
         if: inputs.public-via-load-balancer == true
@@ -813,6 +841,33 @@ jobs:
 
       - name: Set up Cloud SDK
         uses: google-github-actions/setup-gcloud@aa5489c8933f4cc7a4f7d45035b3b1440c9c10db # v3.0.1
+
+      - name: Verify this run's revision is serving 100% of traffic
+        id: traffic
+        env:
+          SERVICE: ${{ inputs.service }}
+          REGION: ${{ inputs.gcp-region }}
+          PROJECT_ID: ${{ inputs.gcp-project-id }}
+          DEPLOYED: ${{ needs.build-and-deploy.outputs.deployed-revision }}
+        run: |
+          set -euo pipefail
+          # Without this, the health check below can pass against whatever
+          # revision happens to be serving — e.g. one pinned by an earlier
+          # rollback — and wave through a deploy that never took traffic.
+          if [ -z "$DEPLOYED" ]; then
+            echo "::error::build-and-deploy did not report a deployed revision — cannot verify what is serving."
+            exit 1
+          fi
+          SERVING=$(gcloud run services describe "$SERVICE" \
+            --region="$REGION" \
+            --project="$PROJECT_ID" \
+            --format=json \
+            | jq -r --arg rev "$DEPLOYED" '[.status.traffic[]? | select(.revisionName == $rev) | (.percent // 0)] | add // 0')
+          echo "Deployed revision ${DEPLOYED} is serving ${SERVING}% of traffic"
+          if [ "$SERVING" != "100" ]; then
+            echo "::error::${DEPLOYED} is serving ${SERVING}%, not 100% — traffic is routed elsewhere (pinned?)."
+            exit 1
+          fi
 
       - name: Post-deploy smoke test
         id: smoke
