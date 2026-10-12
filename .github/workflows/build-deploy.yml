@@ -52,6 +52,11 @@ on:
         description: "Deployer SA email to impersonate via WIF. Optional — falls back to the calling repo's own Environment-scoped GCP_DEPLOYER_SA variable (set by gcp-bootstrap's wire-github.sh) when omitted or empty. Pass explicitly only when a venture doesn't use that variable (e.g. a hardcoded value)."
         required: false
         type: string
+      runtime-service-account:
+        description: "Email of the service account the WEB SERVICE's own container runs as (passed as gcloud run deploy --service-account) — distinct from service_account above, which is the deployer identity this workflow impersonates via WIF to perform the deploy. Optional; empty omits the flag, and Cloud Run then keeps whatever identity the service already has from an earlier deploy or manual change — which is how LiveSimpli/simpli drifted to running its web service as its deployer SA (ADR-0012 in LiveSimpli/simpli-infra). Callers that set it get it enforced on every deploy. The deployer SA needs roles/iam.serviceAccountUser on this runtime SA. Does not affect the scan/dispatcher jobs, which have their own *-service-account inputs."
+        required: false
+        type: string
+        default: ""
       set_secrets:
         description: "Comma-separated SECRET_ENV_NAME=gcp-secret-name:version pairs, mounted at runtime via Cloud Run --set-secrets"
         required: true
@@ -471,6 +476,7 @@ jobs:
           SET_SECRETS: ${{ inputs.set_secrets }}
           EXTRA_ENV_VARS: ${{ inputs.extra-env-vars }}
           PUBLIC_VIA_LB: ${{ inputs.public-via-load-balancer }}
+          RUNTIME_SA: ${{ inputs.runtime-service-account }}
           RUN_ID: ${{ github.run_id }}
           RUN_ATTEMPT: ${{ github.run_attempt }}
         run: |
@@ -500,6 +506,13 @@ jobs:
           else
             INGRESS_FLAG=()
           fi
+          # Opt-in: only callers that set runtime-service-account get the
+          # flag; everyone else keeps today's behavior (no flag) unchanged.
+          if [ -n "$RUNTIME_SA" ]; then
+            RUNTIME_SA_FLAG=(--service-account="$RUNTIME_SA")
+          else
+            RUNTIME_SA_FLAG=()
+          fi
           gcloud run deploy "$SERVICE" \
             --image="$IMAGE" \
             --region="$REGION" \
@@ -507,6 +520,7 @@ jobs:
             --set-env-vars="$ENV_VARS" \
             --set-secrets="$SET_SECRETS" \
             "${INGRESS_FLAG[@]}" \
+            "${RUNTIME_SA_FLAG[@]}" \
             --revision-suffix="$REVISION_SUFFIX" \
             --quiet
           DEPLOYED="${SERVICE}-${REVISION_SUFFIX}"
